@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GraphRAG チャンク抽出デバッガー</title>
+<style>
+  /* ─── リセット・ベース ─────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', 'Hiragino Sans', sans-serif;
+    background: #0d1117;
+    color: #c9d1d9;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ─── ヘッダー ──────────────────────────────────────────── */
+  header {
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  header h1 { font-size: 1rem; font-weight: 600; color: #58a6ff; }
+  header .subtitle { font-size: 0.8rem; color: #8b949e; }
+  header a {
+    margin-left: auto;
+    font-size: 0.8rem;
+    color: #58a6ff;
+    text-decoration: none;
+  }
+  header a:hover { text-decoration: underline; }
+
+  /* ─── レイアウト ────────────────────────────────────────── */
+  .layout {
+    display: flex;
+    flex: 1;
+    gap: 0;
+    overflow: hidden;
+    height: calc(100vh - 49px);
+  }
+
+  /* ─── 左パネル（設定） ──────────────────────────────────── */
+  .sidebar {
+    width: 300px;
+    min-width: 260px;
+    background: #161b22;
+    border-right: 1px solid #30363d;
+    padding: 20px 16px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .sidebar h2 { font-size: 0.85rem; color: #8b949e; text-transform: uppercase; letter-spacing: .05em; }
+
+  .form-group { display: flex; flex-direction: column; gap: 6px; }
+  .form-group label { font-size: 0.82rem; color: #8b949e; }
+  .form-group input[type="number"],
+  .form-group textarea {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    padding: 8px 10px;
+    font-size: 0.85rem;
+    font-family: inherit;
+    outline: none;
+    transition: border-color .15s;
+  }
+  .form-group input[type="number"]:focus,
+  .form-group textarea:focus { border-color: #58a6ff; }
+  .form-group textarea { resize: vertical; min-height: 140px; }
+  .form-group .hint { font-size: 0.75rem; color: #6e7681; }
+
+  .btn-run {
+    background: #238636;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 10px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background .15s;
+    width: 100%;
+  }
+  .btn-run:hover { background: #2ea043; }
+  .btn-run:disabled { background: #21262d; color: #6e7681; cursor: not-allowed; }
+
+  .upload-area {
+    border: 2px dashed #30363d;
+    border-radius: 6px;
+    padding: 16px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+    font-size: 0.82rem;
+    color: #8b949e;
+  }
+  .upload-area:hover { border-color: #58a6ff; background: #1c2128; }
+  .upload-area.has-file { border-color: #238636; color: #3fb950; }
+  #fileInput { display: none; }
+
+  .progress-bar-wrap {
+    background: #21262d;
+    border-radius: 4px;
+    height: 6px;
+    overflow: hidden;
+    display: none;
+  }
+  .progress-bar {
+    height: 100%;
+    background: #238636;
+    transition: width .3s;
+    width: 0%;
+  }
+  #statusMsg { font-size: 0.78rem; color: #8b949e; min-height: 1em; }
+
+  /* ─── メインコンテンツ ──────────────────────────────────── */
+  .main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* ─── チャンクカード ────────────────────────────────────── */
+  .chunk-card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    overflow: hidden;
+    animation: fadeIn .3s ease;
+  }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; } }
+
+  .card-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    background: #1c2128;
+    border-bottom: 1px solid #30363d;
+  }
+  .card-header .badge {
+    background: #1f6feb;
+    color: #fff;
+    font-size: 0.72rem;
+    font-weight: 700;
+    border-radius: 20px;
+    padding: 2px 10px;
+    white-space: nowrap;
+  }
+  .card-header .meta {
+    font-size: 0.78rem;
+    color: #8b949e;
+    flex: 1;
+  }
+  .card-header .elapsed { font-size: 0.75rem; color: #6e7681; }
+
+  .card-body { padding: 0; }
+
+  /* ─── セクション（折りたたみ） ──────────────────────────── */
+  .section {
+    border-bottom: 1px solid #21262d;
+  }
+  .section:last-child { border-bottom: none; }
+  .section-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 0.82rem;
+    color: #8b949e;
+    background: none;
+    border: none;
+    width: 100%;
+    text-align: left;
+    transition: background .1s;
+  }
+  .section-toggle:hover { background: #1c2128; }
+  .section-toggle .icon { font-size: 0.7rem; transition: transform .2s; }
+  .section-toggle.open .icon { transform: rotate(90deg); }
+  .section-toggle .label { font-weight: 600; }
+  .section-toggle .count-badge {
+    background: #30363d;
+    border-radius: 10px;
+    padding: 1px 7px;
+    font-size: 0.72rem;
+    color: #c9d1d9;
+  }
+  .section-toggle .count-badge.ok { background: #238636; }
+  .section-toggle .count-badge.warn { background: #9e6a03; }
+  .section-content {
+    display: none;
+    padding: 0 16px 14px;
+  }
+  .section-content.open { display: block; }
+
+  /* ─── テキスト表示 ──────────────────────────────────────── */
+  .text-block {
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 0.82rem;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+  .text-block.highlight-chunk {
+    border-color: #1f6feb;
+  }
+  .text-block.response {
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 0.78rem;
+    max-height: 400px;
+  }
+  .text-block.system { font-size: 0.75rem; max-height: 200px; }
+
+  /* ─── テーブル ──────────────────────────────────────────── */
+  .result-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    margin-top: 4px;
+  }
+  .result-table th {
+    background: #21262d;
+    color: #8b949e;
+    font-weight: 600;
+    padding: 6px 10px;
+    text-align: left;
+    font-size: 0.75rem;
+    white-space: nowrap;
+  }
+  .result-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid #21262d;
+    vertical-align: top;
+    word-break: break-word;
+  }
+  .result-table tr:last-child td { border-bottom: none; }
+  .result-table tr:hover td { background: #1c2128; }
+  .tag {
+    display: inline-block;
+    background: #1f6feb22;
+    color: #58a6ff;
+    border: 1px solid #1f6feb44;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 0.72rem;
+  }
+
+  /* ─── 空状態 ────────────────────────────────────────────── */
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: #6e7681;
+  }
+  .empty-state .icon { font-size: 3rem; margin-bottom: 12px; }
+  .empty-state p { font-size: 0.9rem; }
+
+  /* ─── エラーバナー ──────────────────────────────────────── */
+  .error-banner {
+    background: #3d1f1f;
+    border: 1px solid #a71d2a;
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: #ffa198;
+    font-size: 0.82rem;
+  }
+
+  /* ─── スクロールバー ────────────────────────────────────── */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>🔬 GraphRAG チャンク抽出デバッガー</h1>
+    <div class="subtitle">チャンクの切り方・LLMへのプロンプト・応答・パース結果を可視化</div>
+  </div>
+  <a href="/">← チャット画面</a>
+</header>
+
+<div class="layout">
+  <!-- ─── 左パネル ──────────────────────────────────────────── -->
+  <aside class="sidebar">
+    <h2>設定</h2>
+
+    <!-- ファイルアップロード -->
+    <div class="form-group">
+      <label>ファイル（.txt / .pdf）</label>
+      <div class="upload-area" id="dropZone" onclick="document.getElementById('fileInput').click()">
+        <div>📄 クリックまたはドロップしてファイルを選択</div>
+        <div id="fileLabel" style="margin-top:4px;font-size:.75rem"></div>
+      </div>
+      <input type="file" id="fileInput" accept=".txt,.pdf">
+      <span class="hint">または下のテキストエリアに直接貼り付け</span>
+    </div>
+
+    <!-- テキスト直接入力 -->
+    <div class="form-group">
+      <label>テキスト（直接入力）</label>
+      <textarea id="textInput" placeholder="ここにテキストを貼り付けることもできます"></textarea>
+    </div>
+
+    <hr style="border-color:#21262d">
+    <h2>チャンク設定</h2>
+
+    <div class="form-group">
+      <label>最大文字数 <code>chunk_max_chars</code></label>
+      <input type="number" id="maxChars" value="200" min="50" max="2000" step="50">
+      <span class="hint">段落がこの文字数以内なら1チャンク。超えたら文末で分割。</span>
+    </div>
+
+    <div class="form-group">
+      <label>オーバーラップ文数 <code>overlap_sentences</code></label>
+      <input type="number" id="overlapSentences" value="1" min="0" max="5">
+      <span class="hint">段落内分割時に前チャンクから引き継ぐ文数（先頭文は常に引き継ぎ）</span>
+    </div>
+
+    <hr style="border-color:#21262d">
+    <h2>実行設定</h2>
+
+    <div class="form-group">
+      <label>処理するチャンク数（上限）</label>
+      <input type="number" id="maxChunks" value="3" min="1" max="20">
+      <span class="hint">先頭からこの件数だけ LLM に送信します。多いと時間がかかります。</span>
+    </div>
+
+    <button class="btn-run" id="runBtn" onclick="runDebug()">▶ 抽出を実行</button>
+
+    <div class="progress-bar-wrap" id="progressWrap">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <div id="statusMsg"></div>
+  </aside>
+
+  <!-- ─── メインコンテンツ ────────────────────────────────── -->
+  <main class="main" id="results">
+    <div class="empty-state">
+      <div class="icon">🧩</div>
+      <p>ファイルをアップロードして「抽出を実行」を押すと<br>チャンクごとのLLM入出力が表示されます</p>
+    </div>
+  </main>
+</div>
+
+<script>
+// ─── ファイル読み込み ─────────────────────────────────────────────────
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const textInput = document.getElementById('textInput');
+const fileLabel = document.getElementById('fileLabel');
+
+fileInput.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  readFile(file);
+});
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.style.borderColor='#58a6ff'; });
+dropZone.addEventListener('dragleave', () => { dropZone.style.borderColor=''; });
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.style.borderColor='';
+  const file = e.dataTransfer.files[0];
+  if (file) readFile(file);
+});
+
+function readFile(file) {
+  const ext = file.name.split('.').pop().toLowerCase();
+  fileLabel.textContent = `読み込み中: ${file.name}`;
+  if (ext === 'txt') {
+    const reader = new FileReader();
+    reader.onload = e => {
+      textInput.value = e.target.result;
+      dropZone.classList.add('has-file');
+      fileLabel.textContent = `✓ ${file.name} (${(file.size/1024).toFixed(1)} KB)`;
+    };
+    reader.readAsText(file, 'utf-8');
+  } else if (ext === 'pdf') {
+    // PDF はサーバー側で読む
+    const formData = new FormData();
+    formData.append('file', file);
+    fetch('/api/rag/debug/read-pdf', { method: 'POST', body: formData })
+      .then(r => r.json())
+      .then(d => {
+        if (d.content) {
+          textInput.value = d.content;
+          dropZone.classList.add('has-file');
+          fileLabel.textContent = `✓ ${file.name} (${d.chars} 文字)`;
+        } else {
+          fileLabel.textContent = `❌ ${d.error || 'PDF読み込み失敗'}`;
+        }
+      })
+      .catch(e => { fileLabel.textContent = `❌ ${e.message}`; });
+  } else {
+    fileLabel.textContent = '❌ .txt または .pdf のみ対応しています';
+  }
+}
+
+// ─── デバッグ実行 ────────────────────────────────────────────────────
+async function runDebug() {
+  const text = textInput.value.trim();
+  if (!text) {
+    setStatus('⚠️ テキストを入力またはファイルを選択してください', 'warn');
+    return;
+  }
+
+  const maxChars   = parseInt(document.getElementById('maxChars').value) || 200;
+  const overlap    = parseInt(document.getElementById('overlapSentences').value) || 1;
+  const maxChunks  = parseInt(document.getElementById('maxChunks').value) || 3;
+
+  const resultsEl = document.getElementById('results');
+  resultsEl.innerHTML = '';
+  setStatus('📤 リクエスト送信中...', '');
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('progressWrap').style.display = 'block';
+  setProgress(0);
+
+  let totalChunks = 0;
+  let processed = 0;
+
+  try {
+    const resp = await fetch('/api/rag/debug/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        file_content: text,
+        max_chars: maxChars,
+        overlap_sentences: overlap,
+        max_chunks: maxChunks,
+      }),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // 未完のラインをバッファへ
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let evt;
+        try { evt = JSON.parse(line.slice(6)); } catch { continue; }
+
+        if (evt.type === 'progress') {
+          totalChunks = evt.total_chunks;
+          setStatus(`🧩 ${evt.message}`, '');
+          setProgress(5);
+        } else if (evt.type === 'result') {
+          processed++;
+          totalChunks = evt.total_chunks;
+          const pct = Math.round((processed / evt.process_count) * 90) + 5;
+          setProgress(pct);
+          setStatus(`⚙️ チャンク ${processed} / ${evt.process_count} 処理完了（全 ${totalChunks} チャンク）`);
+          appendChunkCard(evt);
+        } else if (evt.type === 'done') {
+          setProgress(100);
+          setStatus(`✅ 完了: ${evt.processed} チャンク処理（全 ${evt.total_chunks} チャンク中）`, 'ok');
+        } else if (evt.type === 'error') {
+          appendError(evt.message);
+          setStatus(`❌ エラー: ${evt.message}`, 'error');
+        }
+      }
+    }
+  } catch (e) {
+    appendError(e.message);
+    setStatus(`❌ ${e.message}`, 'error');
+  } finally {
+    document.getElementById('runBtn').disabled = false;
+  }
+}
+
+// ─── チャンクカードの描画 ────────────────────────────────────────────
+function appendChunkCard(evt) {
+  const resultsEl = document.getElementById('results');
+  const card = document.createElement('div');
+  card.className = 'chunk-card';
+
+  const entityCount = evt.entities.length;
+  const relCount    = evt.relations.length;
+
+  card.innerHTML = `
+    <div class="card-header">
+      <span class="badge">チャンク ${evt.chunk_idx + 1} / ${evt.total_chunks}</span>
+      <span class="meta">${evt.tokens} tokens · ${evt.chunk_text.length} 文字</span>
+      <span class="elapsed">⏱ ${evt.elapsed_sec}s</span>
+    </div>
+    <div class="card-body">
+
+      <!-- チャンクテキスト（常に開く） -->
+      <div class="section">
+        <button class="section-toggle open" onclick="toggleSection(this)">
+          <span class="icon">▶</span>
+          <span class="label">📄 チャンクテキスト</span>
+        </button>
+        <div class="section-content open">
+          <div class="text-block highlight-chunk">${escHtml(evt.chunk_text)}</div>
+        </div>
+      </div>
+
+      <!-- LLM応答（常に開く） -->
+      <div class="section">
+        <button class="section-toggle open" onclick="toggleSection(this)">
+          <span class="icon">▶</span>
+          <span class="label">🤖 LLM 生応答</span>
+        </button>
+        <div class="section-content open">
+          <div class="text-block response">${escHtml(evt.raw_response || '（応答なし）')}</div>
+        </div>
+      </div>
+
+      <!-- 抽出エンティティ -->
+      <div class="section">
+        <button class="section-toggle open" onclick="toggleSection(this)">
+          <span class="icon">▶</span>
+          <span class="label">🏷 抽出エンティティ</span>
+          <span class="count-badge ${entityCount > 0 ? 'ok' : 'warn'}">${entityCount} 件</span>
+        </button>
+        <div class="section-content open">
+          ${entityCount > 0 ? renderEntityTable(evt.entities) : '<p style="color:#6e7681;font-size:.8rem;padding:4px 0">エンティティが抽出されませんでした</p>'}
+        </div>
+      </div>
+
+      <!-- 抽出関係 -->
+      <div class="section">
+        <button class="section-toggle open" onclick="toggleSection(this)">
+          <span class="icon">▶</span>
+          <span class="label">🔗 抽出関係 (Relation)</span>
+          <span class="count-badge ${relCount > 0 ? 'ok' : 'warn'}">${relCount} 件</span>
+        </button>
+        <div class="section-content open">
+          ${relCount > 0 ? renderRelationTable(evt.relations) : '<p style="color:#6e7681;font-size:.8rem;padding:4px 0">関係が抽出されませんでした</p>'}
+        </div>
+      </div>
+
+      <!-- ユーザープロンプト（折りたたみ） -->
+      <div class="section">
+        <button class="section-toggle" onclick="toggleSection(this)">
+          <span class="icon">▶</span>
+          <span class="label">📝 ユーザープロンプト（LLMへの入力全文）</span>
+        </button>
+        <div class="section-content">
+          <div class="text-block">${escHtml(evt.user_prompt)}</div>
+        </div>
+      </div>
+
+      <!-- システムプロンプト（折りたたみ） -->
+      <div class="section">
+        <button class="section-toggle" onclick="toggleSection(this)">
+          <span class="icon">▶</span>
+          <span class="label">⚙ システムプロンプト（LightRAG 抽出指示）</span>
+        </button>
+        <div class="section-content">
+          <div class="text-block system">${escHtml(evt.system_prompt)}</div>
+        </div>
+      </div>
+
+    </div>
+  `;
+  resultsEl.appendChild(card);
+}
+
+function renderEntityTable(entities) {
+  const rows = entities.map(e => `
+    <tr>
+      <td>${escHtml(e.name)}</td>
+      <td><span class="tag">${escHtml(e.type)}</span></td>
+      <td>${escHtml(e.description)}</td>
+    </tr>
+  `).join('');
+  return `
+    <table class="result-table">
+      <thead><tr><th>名前</th><th>タイプ</th><th>説明</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderRelationTable(relations) {
+  const rows = relations.map(r => `
+    <tr>
+      <td>${escHtml(r.source)}</td>
+      <td>→</td>
+      <td>${escHtml(r.target)}</td>
+      <td>${escHtml(r.keywords)}</td>
+      <td>${escHtml(r.description)}</td>
+    </tr>
+  `).join('');
+  return `
+    <table class="result-table">
+      <thead><tr><th>発信元</th><th></th><th>対象</th><th>キーワード</th><th>説明</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function appendError(msg) {
+  const resultsEl = document.getElementById('results');
+  const div = document.createElement('div');
+  div.className = 'error-banner';
+  div.textContent = `❌ エラー: ${msg}`;
+  resultsEl.appendChild(div);
+}
+
+// ─── ユーティリティ ───────────────────────────────────────────────────
+function toggleSection(btn) {
+  btn.classList.toggle('open');
+  const content = btn.nextElementSibling;
+  content.classList.toggle('open');
+}
+
+function setStatus(msg, type) {
+  const el = document.getElementById('statusMsg');
+  el.textContent = msg;
+  el.style.color = type === 'ok' ? '#3fb950' : type === 'error' ? '#ffa198' : type === 'warn' ? '#d29922' : '#8b949e';
+}
+
+function setProgress(pct) {
+  document.getElementById('progressBar').style.width = pct + '%';
+}
+
+function escHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>

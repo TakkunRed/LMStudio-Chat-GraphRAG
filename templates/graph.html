@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GraphRAG ナレッジグラフ</title>
+
+  <!-- vis-network CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/dist/vis-network.min.js"></script>
+  <link  href="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/dist/dist/vis-network.min.css" rel="stylesheet" />
+
+  <style>
+    /* ─── リセット & ベース ─────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #1a1a2e;
+      --surface:   #16213e;
+      --card:      #0f3460;
+      --accent:    #e94560;
+      --accent2:   #533483;
+      --text:      #e0e0e0;
+      --text-sub:  #9ea0aa;
+      --border:    #2a2a4a;
+      --radius:    8px;
+    }
+
+    body {
+      font-family: 'Segoe UI', 'Hiragino Sans', 'Yu Gothic', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ─── ヘッダー ──────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    header h1 {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: var(--accent);
+      white-space: nowrap;
+    }
+
+    .header-stats {
+      display: flex;
+      gap: 16px;
+      font-size: 0.8rem;
+      color: var(--text-sub);
+    }
+
+    .header-stats span b { color: var(--text); }
+
+    .search-wrap {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-left: auto;
+      flex-wrap: wrap;
+    }
+
+    .search-wrap input {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      padding: 5px 10px;
+      font-size: 0.85rem;
+      width: 200px;
+      outline: none;
+    }
+    .search-wrap input:focus { border-color: var(--accent); }
+
+    .btn {
+      background: var(--card);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: var(--radius);
+      padding: 5px 12px;
+      font-size: 0.82rem;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s;
+    }
+    .btn:hover  { background: var(--accent2); }
+    .btn.active { background: var(--accent); border-color: var(--accent); }
+
+    .back-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-sub);
+      border-radius: var(--radius);
+      padding: 5px 10px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .back-btn:hover { border-color: var(--accent); color: var(--text); }
+
+    /* ─── メインレイアウト ──────────────────────────────────── */
+    .main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ─── 左サイドバー（フィルター） ───────────────────────── */
+    .sidebar-left {
+      width: 180px;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      overflow-y: auto;
+    }
+
+    .sidebar-section {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .sidebar-section h3 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-sub);
+      margin-bottom: 10px;
+    }
+
+    .type-filter-list { display: flex; flex-direction: column; gap: 6px; }
+
+    .type-chip {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      cursor: pointer;
+      padding: 3px 0;
+      font-size: 0.82rem;
+      user-select: none;
+      border-radius: 4px;
+    }
+    .type-chip:hover { color: #fff; }
+
+    .type-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .type-count {
+      margin-left: auto;
+      font-size: 0.72rem;
+      color: var(--text-sub);
+    }
+
+    .type-chip.hidden .type-dot  { opacity: 0.3; }
+    .type-chip.hidden .type-count { opacity: 0.3; }
+    .type-chip.hidden span:first-of-type { opacity: 0.4; }
+
+    /* ─── グラフキャンバス ──────────────────────────────────── */
+    #graph-container {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+
+    #graph-canvas {
+      width: 100%;
+      height: 100%;
+    }
+
+    /* ローディング */
+    #loading-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: rgba(26,26,46,0.92);
+      z-index: 10;
+      gap: 16px;
+    }
+
+    .spinner {
+      width: 48px;
+      height: 48px;
+      border: 4px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #loading-msg { font-size: 0.9rem; color: var(--text-sub); }
+
+    /* エラー */
+    #error-overlay {
+      display: none;
+      position: absolute;
+      inset: 0;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: rgba(26,26,46,0.92);
+      z-index: 10;
+      gap: 12px;
+      color: var(--accent);
+      font-size: 0.95rem;
+    }
+    #error-overlay.visible { display: flex; }
+
+    /* ズームコントロール */
+    .zoom-controls {
+      position: absolute;
+      bottom: 16px;
+      right: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      z-index: 5;
+    }
+    .zoom-btn {
+      width: 32px;
+      height: 32px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      font-size: 1rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.15s;
+    }
+    .zoom-btn:hover { background: var(--card); }
+
+    /* ─── 右サイドバー（詳細） ──────────────────────────────── */
+    .sidebar-right {
+      width: 280px;
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      overflow-y: auto;
+      transition: transform 0.2s;
+    }
+
+    .detail-header {
+      padding: 14px 16px 10px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .detail-header h2 {
+      font-size: 0.95rem;
+      font-weight: 700;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .detail-type-badge {
+      font-size: 0.68rem;
+      padding: 2px 7px;
+      border-radius: 10px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .detail-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 14px; }
+
+    .detail-section h4 {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-sub);
+      margin-bottom: 6px;
+    }
+
+    .detail-section p {
+      font-size: 0.83rem;
+      line-height: 1.6;
+      color: var(--text);
+    }
+
+    .relation-list { display: flex; flex-direction: column; gap: 5px; }
+
+    .relation-item {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 6px 9px;
+      font-size: 0.78rem;
+    }
+
+    .relation-item .rel-name { font-weight: 600; }
+    .relation-item .rel-keyword { color: var(--text-sub); font-size: 0.72rem; margin-top: 2px; }
+
+    .placeholder-msg {
+      padding: 30px 16px;
+      text-align: center;
+      color: var(--text-sub);
+      font-size: 0.85rem;
+      line-height: 1.7;
+    }
+
+    /* ─── 検索ハイライト数 ──────────────────────────────────── */
+    #search-count {
+      font-size: 0.78rem;
+      color: var(--text-sub);
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ヘッダー -->
+<header>
+  <a href="/" class="back-btn">← チャット</a>
+  <h1>🕸 GraphRAG ナレッジグラフ</h1>
+  <div class="header-stats" id="header-stats">
+    <span>表示: <b id="stat-nodes">-</b> ノード / <b id="stat-edges">-</b> エッジ</span>
+    <span style="color:var(--text-sub);font-size:0.75rem;" id="stat-total"></span>
+    <span>フィルター後: <b id="stat-visible">-</b></span>
+  </div>
+  <div class="search-wrap">
+    <label style="font-size:0.8rem;color:var(--text-sub);white-space:nowrap;">
+      上位
+      <select id="limit-select" style="background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:3px 6px;font-size:0.82rem;">
+        <option value="100">100</option>
+        <option value="300" selected>300</option>
+        <option value="500">500</option>
+        <option value="1000">1000</option>
+        <option value="0">全件</option>
+      </select>
+      件
+    </label>
+    <input id="search-input" type="text" placeholder="ノードを検索…" />
+    <span id="search-count"></span>
+    <button class="btn" id="btn-fit">全体表示</button>
+    <button class="btn" id="btn-physics" title="物理シミュレーション切り替え">⚙ 物理</button>
+  </div>
+</header>
+
+<!-- メイン -->
+<div class="main">
+
+  <!-- 左サイドバー: エンティティタイプフィルター -->
+  <aside class="sidebar-left">
+    <div class="sidebar-section">
+      <h3>エンティティタイプ</h3>
+      <div class="type-filter-list" id="type-filter-list">
+        <div style="color:var(--text-sub);font-size:0.8rem;">読み込み中…</div>
+      </div>
+    </div>
+    <div class="sidebar-section">
+      <h3>エッジ重みフィルター</h3>
+      <div style="font-size:0.78rem;color:var(--text-sub);margin-bottom:6px;">
+        最小重み: <b id="weight-val">1.0</b>
+      </div>
+      <input type="range" id="weight-slider" min="0" max="100" value="0"
+             style="width:100%;accent-color:var(--accent);" />
+    </div>
+    <div class="sidebar-section">
+      <h3>レイアウト</h3>
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        <button class="btn active" id="layout-force" onclick="setLayout('force')">力指向</button>
+        <button class="btn"        id="layout-hier"  onclick="setLayout('hier')">階層</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- グラフキャンバス -->
+  <div id="graph-container">
+    <div id="graph-canvas"></div>
+
+    <div id="loading-overlay">
+      <div class="spinner"></div>
+      <div id="loading-msg">グラフデータを読み込み中…</div>
+    </div>
+
+    <div id="error-overlay">
+      <div>⚠ グラフデータの読み込みに失敗しました</div>
+      <div id="error-detail" style="font-size:0.8rem;color:var(--text-sub);"></div>
+      <button class="btn" onclick="loadGraph()">再試行</button>
+    </div>
+
+    <!-- ズームコントロール -->
+    <div class="zoom-controls">
+      <button class="zoom-btn" id="zoom-in"  title="ズームイン">＋</button>
+      <button class="zoom-btn" id="zoom-out" title="ズームアウト">－</button>
+      <button class="zoom-btn" id="zoom-fit" title="全体表示">⊡</button>
+    </div>
+  </div>
+
+  <!-- 右サイドバー: 選択ノード詳細 -->
+  <aside class="sidebar-right" id="sidebar-right">
+    <div class="placeholder-msg" id="detail-placeholder">
+      ノードをクリックすると<br>詳細が表示されます
+    </div>
+    <div id="detail-panel" style="display:none;">
+      <div class="detail-header">
+        <h2 id="detail-name"></h2>
+        <span class="detail-type-badge" id="detail-type-badge"></span>
+      </div>
+      <div class="detail-body">
+        <div class="detail-section" id="detail-desc-section">
+          <h4>説明</h4>
+          <p id="detail-desc"></p>
+        </div>
+        <div class="detail-section" id="detail-rels-section">
+          <h4>関連エンティティ</h4>
+          <div class="relation-list" id="detail-rels"></div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+</div>
+
+<script>
+// ─── 定数・状態 ───────────────────────────────────────────────────────
+
+// エンティティタイプ → 色
+const TYPE_COLORS = {
+  "人物":   { bg: "#e94560", border: "#c73350", font: "#fff" },
+  "組織":   { bg: "#533483", border: "#3e2660", font: "#fff" },
+  "概念":   { bg: "#0f3460", border: "#0a2540", font: "#e0e0e0" },
+  "場所":   { bg: "#16856e", border: "#106050", font: "#fff" },
+  "イベント":{ bg: "#c47d11", border: "#a06010", font: "#fff" },
+  "製品":   { bg: "#1a6e9e", border: "#135580", font: "#fff" },
+  "その他": { bg: "#444466", border: "#333355", font: "#e0e0e0" },
+};
+
+function getTypeColor(type) {
+  return TYPE_COLORS[type] || TYPE_COLORS["その他"];
+}
+
+let allNodes = [];
+let allEdges = [];
+let network  = null;
+let visNodes = null;
+let visEdges = null;
+let hiddenTypes = new Set();
+let minWeight  = 0;
+let physicsOn  = true;
+
+// ─── グラフデータ読み込み ────────────────────────────────────────────
+
+async function loadGraph() {
+  document.getElementById("loading-overlay").style.display = "flex";
+  document.getElementById("loading-msg").textContent = "グラフデータを読み込み中…";
+  document.getElementById("error-overlay").classList.remove("visible");
+
+  // ネットワークを破棄して再構築
+  if (network) { network.destroy(); network = null; }
+  hideDetail();
+
+  const limitVal = document.getElementById("limit-select").value;
+
+  try {
+    const resp = await fetch(`/api/graph/data?limit=${limitVal}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+
+    if (data.error) throw new Error(data.error);
+
+    allNodes = data.nodes || [];
+    allEdges = data.edges || [];
+
+    const s = data.stats;
+    document.getElementById("stat-nodes").textContent = s.node_count;
+    document.getElementById("stat-edges").textContent = s.edge_count;
+
+    const totalEl = document.getElementById("stat-total");
+    if (s.total_nodes && s.total_nodes > s.node_count) {
+      totalEl.textContent = `(全 ${s.total_nodes} ノード中 接続数上位を表示)`;
+    } else {
+      totalEl.textContent = "";
+    }
+
+    initTypeFilters();
+    initWeightSlider();
+    // buildGraph 内の stabilizationIterationsDone でローディングを非表示にする
+    document.getElementById("loading-msg").textContent = "レイアウト計算中…";
+    buildGraph();
+  } catch (err) {
+    document.getElementById("loading-overlay").style.display = "none";
+    document.getElementById("error-overlay").classList.add("visible");
+    document.getElementById("error-detail").textContent = err.message;
+  }
+}
+
+// 件数変更時に再読み込み
+document.getElementById("limit-select").addEventListener("change", () => {
+  hiddenTypes.clear();
+  minWeight = 0;
+  document.getElementById("weight-slider").value = 0;
+  document.getElementById("weight-val").textContent = "0.0";
+  loadGraph();
+});
+
+// ─── タイプフィルター ────────────────────────────────────────────────
+
+function initTypeFilters() {
+  const counts = {};
+  allNodes.forEach(n => {
+    const t = n.entity_type || "その他";
+    counts[t] = (counts[t] || 0) + 1;
+  });
+
+  const list = document.getElementById("type-filter-list");
+  list.innerHTML = "";
+
+  // 出現順ではなく種類名でソート（よく使うものを上に）
+  const order = ["人物","組織","概念","場所","イベント","製品","その他"];
+  const types  = [...new Set([...order.filter(t => counts[t]), ...Object.keys(counts).filter(t => !order.includes(t))])];
+
+  types.forEach(type => {
+    const col  = getTypeColor(type);
+    const chip = document.createElement("div");
+    chip.className = "type-chip";
+    chip.dataset.type = type;
+    chip.innerHTML = `
+      <span class="type-dot" style="background:${col.bg};"></span>
+      <span>${type}</span>
+      <span class="type-count">${counts[type] || 0}</span>
+    `;
+    chip.addEventListener("click", () => toggleType(type, chip));
+    list.appendChild(chip);
+  });
+}
+
+function toggleType(type, chip) {
+  if (hiddenTypes.has(type)) {
+    hiddenTypes.delete(type);
+    chip.classList.remove("hidden");
+  } else {
+    hiddenTypes.add(type);
+    chip.classList.add("hidden");
+  }
+  applyFilters();
+}
+
+// ─── 重みスライダー ──────────────────────────────────────────────────
+
+function initWeightSlider() {
+  const weights = allEdges.map(e => e.weight).filter(w => !isNaN(w));
+  const maxW    = weights.length ? Math.max(...weights) : 1;
+
+  const slider = document.getElementById("weight-slider");
+  slider.max   = Math.ceil(maxW * 10);
+  slider.value = 0;
+  minWeight    = 0;
+
+  slider.addEventListener("input", () => {
+    minWeight = slider.value / 10;
+    document.getElementById("weight-val").textContent = minWeight.toFixed(1);
+    applyFilters();
+  });
+}
+
+// ─── グラフ構築 ──────────────────────────────────────────────────────
+
+function buildGraph() {
+  const container = document.getElementById("graph-canvas");
+
+  const visNodeData = allNodes.map(n => {
+    const col  = getTypeColor(n.entity_type);
+    return {
+      id:          n.id,
+      label:       n.label,
+      title:       `<b>${n.label}</b><br>${n.entity_type}<br>${n.description.slice(0,80)}`,
+      color:       { background: col.bg, border: col.border, highlight: { background: "#fff", border: col.border } },
+      font:        { color: col.font, size: 13, face: "Segoe UI,Hiragino Sans,sans-serif" },
+      borderWidth: 1.5,
+      shape:       "dot",
+      size:        10,
+      _type:       n.entity_type,
+      _desc:       n.description,
+    };
+  });
+
+  const visEdgeData = allEdges.map(e => ({
+    id:          e.id,
+    from:        e.from,
+    to:          e.to,
+    label:       e.label || "",
+    title:       e.keywords || "",
+    width:       Math.max(0.5, Math.min(e.weight * 0.8, 5)),
+    color:       { color: "#334", highlight: "#e94560", hover: "#888" },
+    font:        { size: 9, color: "#778", face: "Segoe UI,sans-serif", strokeWidth: 0 },
+    smooth:      { type: "continuous" },
+    _weight:     e.weight,
+    _keywords:   e.keywords,
+    _desc:       e.description,
+  }));
+
+  visNodes = new vis.DataSet(visNodeData);
+  visEdges = new vis.DataSet(visEdgeData);
+
+  const options = buildOptions("force");
+
+  network = new vis.Network(container, { nodes: visNodes, edges: visEdges }, options);
+
+  // イベント
+  network.on("selectNode", params => {
+    if (params.nodes.length === 1) showNodeDetail(params.nodes[0]);
+  });
+  network.on("deselectNode", () => hideDetail());
+  network.on("stabilizationProgress", params => {
+    const pct = Math.round(params.iterations / params.total * 100);
+    const msgEl = document.getElementById("loading-msg");
+    if (msgEl) msgEl.textContent = `レイアウト計算中… ${pct}%`;
+  });
+  network.on("stabilizationIterationsDone", () => {
+    document.getElementById("loading-overlay").style.display = "none";
+    network.fit({ animation: { duration: 500 } });
+    updateStatVisible();
+  });
+
+  updateStatVisible();
+}
+
+function buildOptions(layout) {
+  const base = {
+    interaction: {
+      hover: true,
+      tooltipDelay: 200,
+      navigationButtons: false,
+      keyboard: false,
+    },
+    nodes: { scaling: { min: 8, max: 30 } },
+    edges: { arrows: { to: { enabled: false } } },
+    physics: {
+      enabled: physicsOn,
+      stabilization: { iterations: 200, updateInterval: 20 },
+      barnesHut: {
+        gravitationalConstant: -4000,
+        centralGravity: 0.3,
+        springLength: 120,
+        damping: 0.15,
+      },
+    },
+  };
+
+  if (layout === "hier") {
+    base.layout = { hierarchical: { direction: "UD", sortMethod: "directed", nodeSpacing: 100 } };
+    base.physics = { enabled: false };
+  }
+
+  return base;
+}
+
+// ─── フィルタリング ──────────────────────────────────────────────────
+
+function applyFilters() {
+  if (!visNodes || !visEdges) return;
+
+  // 非表示にするノード
+  const hiddenNodeIds = new Set(
+    allNodes
+      .filter(n => hiddenTypes.has(n.entity_type))
+      .map(n => n.id)
+  );
+
+  visNodes.forEach(n => {
+    visNodes.update({ id: n.id, hidden: hiddenNodeIds.has(n.id) });
+  });
+
+  // 重みフィルター & 両端ノードが非表示のエッジ
+  visEdges.forEach(e => {
+    const tooLight = (e._weight || 1) < minWeight;
+    const orphan   = hiddenNodeIds.has(e.from) || hiddenNodeIds.has(e.to);
+    visEdges.update({ id: e.id, hidden: tooLight || orphan });
+  });
+
+  updateStatVisible();
+}
+
+function countVisible() {
+  let cnt = 0;
+  visNodes && visNodes.forEach(n => { if (!n.hidden) cnt++; });
+  return cnt;
+}
+
+function updateStatVisible() {
+  document.getElementById("stat-visible").textContent = countVisible();
+}
+
+// ─── 検索 ────────────────────────────────────────────────────────────
+
+let searchTimeout = null;
+
+document.getElementById("search-input").addEventListener("input", e => {
+  clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(() => doSearch(e.target.value.trim()), 200);
+});
+
+function doSearch(query) {
+  if (!visNodes) return;
+  const countEl = document.getElementById("search-count");
+
+  if (!query) {
+    visNodes.forEach(n => visNodes.update({ id: n.id, borderWidth: 1.5 }));
+    network && network.unselectAll();
+    countEl.textContent = "";
+    return;
+  }
+
+  const lower = query.toLowerCase();
+  const matched = [];
+  const notMatched = [];
+
+  allNodes.forEach(n => {
+    if ((n.label || "").toLowerCase().includes(lower) ||
+        (n._desc  || "").toLowerCase().includes(lower)) {
+      matched.push(n.id);
+    } else {
+      notMatched.push(n.id);
+    }
+  });
+
+  // ハイライト
+  matched.forEach(id => visNodes.update({ id, borderWidth: 4 }));
+  notMatched.forEach(id => visNodes.update({ id, borderWidth: 1.5 }));
+
+  if (matched.length) {
+    network.selectNodes(matched);
+    network.fit({ nodes: matched, animation: { duration: 400 } });
+  }
+
+  countEl.textContent = `${matched.length}件`;
+}
+
+// ─── ノード詳細 ──────────────────────────────────────────────────────
+
+function showNodeDetail(nodeId) {
+  const node = allNodes.find(n => n.id === nodeId);
+  if (!node) return;
+
+  const col = getTypeColor(node.entity_type);
+
+  document.getElementById("detail-placeholder").style.display = "none";
+  document.getElementById("detail-panel").style.display = "block";
+  document.getElementById("detail-name").textContent = node.label;
+
+  const badge = document.getElementById("detail-type-badge");
+  badge.textContent = node.entity_type;
+  badge.style.background = col.bg;
+  badge.style.color       = col.font;
+
+  document.getElementById("detail-desc").textContent =
+    node._desc || node.description || "説明なし";
+
+  // 関連エッジ
+  const relEdges = allEdges.filter(e => e.from === nodeId || e.to === nodeId);
+  const relList  = document.getElementById("detail-rels");
+  relList.innerHTML = "";
+
+  if (relEdges.length === 0) {
+    relList.innerHTML = `<div style="color:var(--text-sub);font-size:0.8rem;">関連なし</div>`;
+  } else {
+    // 重み降順 top-15
+    relEdges
+      .sort((a, b) => (b.weight || 0) - (a.weight || 0))
+      .slice(0, 15)
+      .forEach(e => {
+        const other = e.from === nodeId ? e.to : e.from;
+        const item  = document.createElement("div");
+        item.className = "relation-item";
+        item.innerHTML = `
+          <div class="rel-name">${other}</div>
+          ${e._keywords ? `<div class="rel-keyword">${e._keywords.slice(0,60)}</div>` : ""}
+        `;
+        // クリックで相手ノードに移動
+        item.style.cursor = "pointer";
+        item.addEventListener("click", () => {
+          network.focus(other, { scale: 1.2, animation: { duration: 400 } });
+          network.selectNodes([other]);
+          showNodeDetail(other);
+        });
+        relList.appendChild(item);
+      });
+  }
+}
+
+function hideDetail() {
+  document.getElementById("detail-placeholder").style.display = "";
+  document.getElementById("detail-panel").style.display = "none";
+}
+
+// ─── レイアウト切替 ──────────────────────────────────────────────────
+
+function setLayout(type) {
+  document.getElementById("layout-force").classList.toggle("active", type === "force");
+  document.getElementById("layout-hier").classList.toggle("active",  type === "hier");
+
+  if (!network) return;
+  if (type === "hier") {
+    network.setOptions({
+      layout: { hierarchical: { direction: "UD", sortMethod: "directed", nodeSpacing: 100 } },
+      physics: { enabled: false },
+    });
+  } else {
+    network.setOptions({
+      layout: { hierarchical: { enabled: false } },
+      physics: {
+        enabled: physicsOn,
+        barnesHut: { gravitationalConstant: -4000, centralGravity: 0.3, springLength: 120, damping: 0.15 },
+      },
+    });
+  }
+  network.fit({ animation: { duration: 500 } });
+}
+
+// ─── ボタン ──────────────────────────────────────────────────────────
+
+document.getElementById("btn-fit").addEventListener("click", () => {
+  network && network.fit({ animation: { duration: 500 } });
+});
+
+document.getElementById("btn-physics").addEventListener("click", function() {
+  physicsOn = !physicsOn;
+  this.classList.toggle("active", physicsOn);
+  network && network.setOptions({ physics: { enabled: physicsOn } });
+});
+
+document.getElementById("zoom-in").addEventListener("click", () => {
+  if (!network) return;
+  const s = network.getScale();
+  network.moveTo({ scale: s * 1.3, animation: { duration: 200 } });
+});
+document.getElementById("zoom-out").addEventListener("click", () => {
+  if (!network) return;
+  const s = network.getScale();
+  network.moveTo({ scale: s / 1.3, animation: { duration: 200 } });
+});
+document.getElementById("zoom-fit").addEventListener("click", () => {
+  network && network.fit({ animation: { duration: 400 } });
+});
+
+// ─── 起動 ────────────────────────────────────────────────────────────
+
+loadGraph();
+</script>
+</body>
+</html>

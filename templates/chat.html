@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LM Studio Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        /* ── タブ ── */
+        .tab-bar {
+            display: flex;
+            border-bottom: 1px solid #333;
+            margin: 0 -16px;
+            padding: 0 16px;
+            flex-shrink: 0;
+        }
+        .tab-btn {
+            flex: 1;
+            padding: 8px 0;
+            background: none;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: #888;
+            font-size: 13px;
+            cursor: pointer;
+            transition: color .2s, border-color .2s;
+        }
+        .tab-btn.active {
+            color: #fff;
+            border-bottom-color: #6366f1;
+        }
+        .tab-content {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            padding-top: 8px;
+        }
+        /* 履歴タブは list が flex-grow */
+        #tab-history {
+            padding-top: 0;
+        }
+        #tab-history .history-list {
+            flex: 1;
+            overflow-y: auto;
+            margin-top: 0;
+        }
+
+        /* ── RAG ソース表示 ── */
+        .rag-sources {
+            margin-top: 6px;
+            font-size: 11px;
+            color: #888;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            align-items: center;
+        }
+        .rag-source-tag {
+            background: #2a2a3a;
+            border: 1px solid #444;
+            border-radius: 4px;
+            padding: 1px 6px;
+            cursor: default;
+        }
+
+        /* ── 設定モーダル内セクション ── */
+        .modal-section-title {
+            font-size: 11px;
+            font-weight: 600;
+            color: #6366f1;
+            text-transform: uppercase;
+            letter-spacing: .05em;
+            margin: 16px 0 8px;
+            padding-bottom: 4px;
+            border-bottom: 1px solid #333;
+        }
+        .modal-section-title:first-child {
+            margin-top: 0;
+        }
+        .modal-body {
+            overflow-y: auto;
+            max-height: 70vh;
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <!-- サイドバー -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <h2>💬 LM Studio Chat</h2>
+                <button class="sidebar-toggle" onclick="toggleSidebar()">☰</button>
+            </div>
+
+            <!-- タブバー -->
+            <div class="tab-bar">
+                <button class="tab-btn active" id="tabBtn-settings" onclick="switchTab('settings')">設定</button>
+                <button class="tab-btn"        id="tabBtn-history"  onclick="switchTab('history')">履歴</button>
+            </div>
+
+            <!-- ── 設定タブ ── -->
+            <div class="tab-content" id="tab-settings">
+
+                <!-- 接続状態 -->
+                <div class="connection-status">
+                    <span class="status-dot" id="statusDot"></span>
+                    <span id="statusText">接続確認中...</span>
+                </div>
+
+                <!-- モデル選択 -->
+                <div class="sidebar-section">
+                    <label>モデル</label>
+                    <select id="modelSelect" class="sidebar-select">
+                        <option value="">自動検出（デフォルト）</option>
+                    </select>
+                    <button class="btn-small" onclick="fetchModels()">🔄 更新</button>
+                </div>
+
+                <!-- RAG トグル（シンプル版） -->
+                <div class="sidebar-section">
+                    <label>RAG ドキュメント検索</label>
+                    <div style="display:flex; align-items:center; gap:8px; margin-top:6px;">
+                        <input type="checkbox" id="ragToggle" onchange="onRagToggle()">
+                        <span id="ragToggleLabel" style="font-size:13px; color:#888;">オフ</span>
+                        <span id="ragChunkBadge" style="font-size:11px; color:#555; margin-left:auto;"></span>
+                    </div>
+                </div>
+
+                <!-- ツール状態（読み取り専用表示） -->
+                <div class="sidebar-section">
+                    <label>Function Calling</label>
+                    <div id="toolStatus" style="font-size:11px; margin-top:4px; color:#888;">⚠️ ツール未登録</div>
+                </div>
+
+                <!-- アクションボタン -->
+                <div class="sidebar-actions">
+                    <button class="btn-new-chat" onclick="newChat()">🆕 新規チャット</button>
+                    <button class="btn-clear"    onclick="clearHistory()">🗑️ 履歴削除</button>
+                    <button class="btn-settings" onclick="showSettings()">⚙️ 設定</button>
+                    <a href="/logout" class="btn-logout">🚪 ログアウト</a>
+                </div>
+            </div>
+
+            <!-- ── 履歴タブ ── -->
+            <div class="tab-content" id="tab-history" style="display:none;">
+                <div id="historyList" class="history-list">
+                    {% for msg in history[:20] %}
+                    <div class="history-item">
+                        <span class="history-role {{ msg.role }}">{{ msg.role }}</span>
+                        <span class="history-content">{{ msg.content[:60] }}...</span>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </aside>
+
+        <!-- メインチャットエリア -->
+        <main class="chat-main">
+            <div class="chat-header">
+                <button class="menu-btn" onclick="toggleSidebar()">☰</button>
+                <h1>LM Studio Chat</h1>
+                <div class="header-right">
+                    <span class="lm-url" id="lmUrl">{{ lm_studio_url }}</span>
+                </div>
+            </div>
+
+            <div class="chat-messages" id="chatMessages">
+                <div class="welcome-message">
+                    <div class="welcome-icon">🤖</div>
+                    <h2>LM Studio Chat へようこそ</h2>
+                    <p>LM Studio のローカル LLM サーバーとチャットできます。</p>
+                    <p style="margin-top:10px; color:#666;">メッセージを入力して送信してください。</p>
+                </div>
+            </div>
+
+            <div class="chat-input-area">
+                <div class="input-wrapper">
+                    <textarea
+                        id="messageInput"
+                        placeholder="メッセージを入力..."
+                        rows="1"
+                        class="chat-input"
+                        onkeydown="handleKeyDown(event)"
+                        oninput="autoResize(this)"
+                    ></textarea>
+                    <button class="send-btn" onclick="sendMessage()" id="sendBtn">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="22" y1="2" x2="11" y2="13"></line>
+                            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                        </svg>
+                    </button>
+                </div>
+                <div class="input-hint">Enter で送信 • Shift+Enter で改行</div>
+            </div>
+        </main>
+    </div>
+
+    <!-- ══ 設定モーダル（全設定を統合） ══ -->
+    <div class="modal-overlay" id="settingsModal" style="display:none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>⚙️ 設定</h2>
+                <button class="modal-close" onclick="hideSettings()">✕</button>
+            </div>
+            <div class="modal-body">
+
+                <!-- パラメータ -->
+                <div class="modal-section-title">パラメータ</div>
+                <div class="form-group">
+                    <label>温度 (Temperature) <span id="temperatureValue">0.7</span></label>
+                    <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7">
+                </div>
+                <div class="form-group">
+                    <label>最大トークン数</label>
+                    <input type="number" id="maxTokens" min="2048" max="262144" value="8192" class="sidebar-input">
+                </div>
+
+                <!-- GraphRAG -->
+                <div class="modal-section-title">GraphRAG ドキュメント検索</div>
+                <div class="form-group">
+                    <div id="ragStatusModal" style="font-size:12px; color:#888; margin-bottom:8px;">－</div>
+                    <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                        <button class="btn-small" onclick="fetchRagStatusModal()">🔄 状態確認</button>
+                        <button class="btn-small" onclick="document.getElementById('ragFileInput').click()">📄 ファイル追加</button>
+                        <button class="btn-small" onclick="reindexRagDir()">🗂️ フォルダ再スキャン</button>
+                    </div>
+                    <input type="file" id="ragFileInput" accept=".txt,.pdf" style="display:none" onchange="uploadRagFile(event)">
+                </div>
+                <div class="form-group" style="margin-top:10px;">
+                    <label>検索モード</label>
+                    <select id="ragSearchMode" class="sidebar-input" style="width:100%; padding:4px 8px;">
+                        <option value="hybrid">hybrid（推奨）— ローカル＋グローバルを統合</option>
+                        <option value="local">local — エンティティ周辺の詳細検索</option>
+                        <option value="global">global — ドキュメント全体のテーマ検索</option>
+                        <option value="naive">naive — シンプルなベクトル検索</option>
+                    </select>
+                </div>
+                <div style="display:flex; gap:6px; align-items:center; margin-top:6px; flex-wrap:wrap;">
+                    <button class="btn-small" onclick="saveRagConfig()">💾 検索モードを保存</button>
+                    <a href="/graph" target="_blank"
+                       style="display:inline-flex;align-items:center;gap:4px;padding:4px 10px;
+                              background:#1a3a5c;border:1px solid #2a4a6c;border-radius:4px;
+                              color:#7eb8e8;font-size:12px;text-decoration:none;cursor:pointer;"
+                       title="登録済みグラフデータを可視化">
+                        🕸 グラフを可視化
+                    </a>
+                    <a href="/debug" target="_blank"
+                       style="display:inline-flex;align-items:center;gap:4px;padding:4px 10px;
+                              background:#1a3a2c;border:1px solid #2a4a3c;border-radius:4px;
+                              color:#7ec89e;font-size:12px;text-decoration:none;cursor:pointer;"
+                       title="チャンクの切り方・LLMへの入出力を確認するデバッグツール">
+                        🔬 抽出デバッガー
+                    </a>
+                </div>
+                <div id="ragConfigStatus" style="font-size:11px; margin-top:6px; color:#888;"></div>
+                <div style="font-size:11px; color:#666; margin-top:4px;">
+                    ℹ️ ファイル追加時は LM Studio の LLM・エンベディングモデルが起動していることを確認してください
+                </div>
+
+                <!-- Function Calling -->
+                <div class="modal-section-title">Function Calling ツール (JSON)</div>
+                <div class="form-group">
+                    <textarea id="toolConfig" rows="8" placeholder='[
+  {
+    "type": "function",
+    "function": {
+      "name": "search_web",
+      "description": "ウェブ検索を実行",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string"}
+        },
+        "required": ["query"]
+      }
+    }
+  }
+]' style="font-family:monospace; font-size:11px; width:100%; box-sizing:border-box;"></textarea>
+                    <div style="display:flex; gap:6px; margin-top:6px;">
+                        <button class="btn-small" onclick="parseTools()">🔄 読み込み</button>
+                        <button class="btn-small" onclick="saveTools()">💾 保存</button>
+                        <button class="btn-small" onclick="clearTools()">🗑️ クリア</button>
+                    </div>
+                    <div id="toolSaveStatus" style="font-size:11px; margin-top:4px; color:#888;"></div>
+                </div>
+
+                <!-- LM Studio 接続 -->
+                <div class="modal-section-title">LM Studio 接続</div>
+                <div class="form-group">
+                    <label>ホスト</label>
+                    <input type="text" id="settingHost" value="{{ lm_studio_url.split('://')[1].split(':')[0] }}">
+                </div>
+                <div class="form-group">
+                    <label>ポート</label>
+                    <input type="number" id="settingPort" value="{{ lm_studio_url.split('://')[1].split(':')[1] }}">
+                </div>
+                <div class="form-group">
+                    <label>API キー</label>
+                    <input type="password" id="settingApiKey" placeholder="空白の場合は認証なし">
+                </div>
+
+                <!-- 認証 -->
+                <div class="modal-section-title">アプリ認証</div>
+                <div class="form-group">
+                    <label>ユーザー名</label>
+                    <input type="text" id="settingUsername" value="admin">
+                </div>
+                <div class="form-group">
+                    <label>パスワード</label>
+                    <input type="password" id="settingPassword" placeholder="新しいパスワード">
+                </div>
+
+            </div>
+            <div class="modal-footer">
+                <button class="btn-cancel" onclick="hideSettings()">キャンセル</button>
+                <button class="btn-save"   onclick="saveSettings()">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ─── グローバル変数 ───────────────────────────────────────────────
+        let currentSessionId = "{{ session_id }}";
+        let isStreaming = false;
+        let currentTools = [];
+        let ragEnabled = false;
+
+        // ─── 初期化 ──────────────────────────────────────────────────────
+        document.addEventListener('DOMContentLoaded', () => {
+            checkConnection();
+            fetchModels();
+            updateTemperatureDisplay();
+            fetchRagStatusBadge();
+            loadSavedTools();
+        });
+
+        // ─── タブ切り替え ────────────────────────────────────────────────
+        function switchTab(name) {
+            ['settings', 'history'].forEach(t => {
+                document.getElementById(`tab-${t}`).style.display     = t === name ? 'flex' : 'none';
+                document.getElementById(`tabBtn-${t}`).classList.toggle('active', t === name);
+            });
+        }
+
+        // ─── 接続確認 ────────────────────────────────────────────────────
+        async function checkConnection() {
+            const dot  = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            try {
+                const res = await fetch('/api/models');
+                if (res.ok) {
+                    dot.style.background = '#4ade80';
+                    text.textContent = '接続済み';
+                } else { throw new Error(); }
+            } catch {
+                dot.style.background = '#f87171';
+                text.textContent = '接続エラー';
+                addSystemMessage('⚠️ LM Studio サーバーに接続できません。サーバーが実行中か確認してください。');
+            }
+        }
+
+        // ─── モデル取得 ─────────────────────────────────────────────────
+        async function fetchModels() {
+            const select = document.getElementById('modelSelect');
+            try {
+                const res  = await fetch('/api/models');
+                const data = await res.json();
+                select.innerHTML = '<option value="">自動検出（デフォルト）</option>';
+                data.models.forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m.id;
+                    opt.textContent = m.id;
+                    select.appendChild(opt);
+                });
+            } catch (e) { console.error('モデル取得エラー:', e); }
+        }
+
+        // ─── チャット送信 ───────────────────────────────────────────────
+        async function sendMessage() {
+            if (isStreaming) return;
+
+            const input   = document.getElementById('messageInput');
+            const message = input.value.trim();
+            if (!message) return;
+
+            input.value = '';
+            input.style.height = 'auto';
+            appendMessage('user', message);
+
+            // 画面上のメッセージから履歴を再構築
+            const messages = [];
+            document.getElementById('chatMessages').querySelectorAll('.message-item').forEach(el => {
+                if (el.dataset.role) {
+                    messages.push({ role: el.dataset.role, content: el.dataset.content });
+                }
+            });
+
+            // ローディング
+            const loadingId  = 'loading-' + Date.now();
+            const loadingDiv = document.createElement('div');
+            loadingDiv.className  = 'message-item message-assistant';
+            loadingDiv.id         = loadingId;
+            loadingDiv.dataset.role = 'assistant';
+            loadingDiv.innerHTML  = `
+                <div class="message-bubble">
+                    <div class="message-header">
+                        <span class="message-role">🤖 AI</span>
+                        <span class="message-time">${new Date().toLocaleTimeString()}</span>
+                    </div>
+                    <div class="message-content" id="${loadingId}-content">
+                        <div class="loading-dots"><span></span><span></span><span></span></div>
+                        ${currentTools.length > 0 ? `<div style="font-size:11px;color:#888;margin-top:4px;">🔧 ツール使用中 (${currentTools.length}件)</div>` : ''}
+                        ${ragEnabled ? `<div style="font-size:11px;color:#888;margin-top:4px;">📄 RAG検索中...</div>` : ''}
+                    </div>
+                </div>`;
+            document.getElementById('chatMessages').appendChild(loadingDiv);
+            scrollToBottom();
+
+            const model       = document.getElementById('modelSelect').value;
+            const temperature = parseFloat(document.getElementById('temperature').value);
+            const maxTokens   = parseInt(document.getElementById('maxTokens').value);
+
+            try {
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        messages, model, temperature,
+                        max_tokens: maxTokens,
+                        tools: currentTools,
+                        use_rag: ragEnabled,
+                    }),
+                });
+                const data = await res.json();
+                document.getElementById(loadingId)?.remove();
+
+                if (data.reply) {
+                    appendMessage('assistant', data.reply, data.rag_sources || []);
+                    updateHistoryList(data.history || []);
+                } else if (data.error) {
+                    addSystemMessage(`⚠️ エラー: ${data.error}`);
+                }
+            } catch (e) {
+                document.getElementById(loadingId)?.remove();
+                addSystemMessage(`⚠️ 通信エラー: ${e.message}`);
+            }
+        }
+
+        // ─── メッセージ表示 ─────────────────────────────────────────────
+        function appendMessage(role, content, ragSources = []) {
+            const historyEl = document.getElementById('chatMessages');
+            historyEl.querySelector('.welcome-message')?.remove();
+
+            const div = document.createElement('div');
+            div.className      = `message-item message-${role === 'user' ? 'user' : 'assistant'}`;
+            div.dataset.role    = role;
+            div.dataset.content = content;
+
+            const isUser = role === 'user';
+            const ragHtml = (!isUser && ragSources.length > 0)
+                ? `<div class="rag-sources">📄 参照: ${ragSources.map(s =>
+                    `<span class="rag-source-tag" title="類似度: ${s.score}">${s.source}</span>`).join('')}</div>`
+                : '';
+
+            div.innerHTML = `
+                <div class="message-bubble">
+                    <div class="message-header">
+                        <span class="message-role">${isUser ? '👤 あなた' : '🤖 AI'}</span>
+                        <span class="message-time">${new Date().toLocaleTimeString()}</span>
+                    </div>
+                    <div class="message-content">${formatContent(content)}</div>
+                    ${ragHtml}
+                </div>`;
+            historyEl.appendChild(div);
+            scrollToBottom();
+        }
+
+        function formatContent(text) {
+            let html = text
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\*(.+?)\*/g,     '<em>$1</em>')
+                .replace(/`(.+?)`/g,       '<code>$1</code>')
+                .replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
+                .replace(/\n/g, '<br>');
+            return html;
+        }
+
+        function addSystemMessage(content) {
+            const historyEl = document.getElementById('chatMessages');
+            historyEl.querySelector('.welcome-message')?.remove();
+            const div = document.createElement('div');
+            div.className = 'message-item message-system';
+            div.innerHTML = `<div class="message-bubble message-bubble-system"><div class="message-content">${content}</div></div>`;
+            historyEl.appendChild(div);
+            scrollToBottom();
+        }
+
+        function scrollToBottom() {
+            const el = document.getElementById('chatMessages');
+            setTimeout(() => { el.scrollTop = el.scrollHeight; }, 50);
+        }
+
+        // ─── 履歴管理 ───────────────────────────────────────────────────
+        function updateHistoryList(history) {
+            const list = document.getElementById('historyList');
+            list.innerHTML = '';
+            history.slice(-20).reverse().forEach(msg => {
+                const item = document.createElement('div');
+                item.className = 'history-item';
+                const icon = msg.role === 'user' ? '👤' : '🤖';
+                item.innerHTML = `
+                    <span class="history-role ${msg.role === 'user' ? 'history-role-user' : 'history-role-assistant'}">${icon}</span>
+                    <span class="history-content">${escapeHtml(msg.content.substring(0, 60))}${msg.content.length > 60 ? '...' : ''}</span>`;
+                list.appendChild(item);
+            });
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function newChat() {
+            document.getElementById('chatMessages').innerHTML = `
+                <div class="welcome-message">
+                    <div class="welcome-icon">🤖</div>
+                    <h2>LM Studio Chat へようこそ</h2>
+                    <p>LM Studio のローカル LLM サーバーとチャットできます。</p>
+                    <p style="margin-top:10px;color:#666;">メッセージを入力して送信してください。</p>
+                </div>`;
+        }
+
+        async function clearHistory() {
+            if (!confirm('履歴を削除してもよろしいですか？')) return;
+            try {
+                await fetch('/api/clear-history', { method: 'POST' });
+                newChat();
+            } catch { alert('履歴の削除に失敗しました'); }
+        }
+
+        // ─── 設定モーダル ───────────────────────────────────────────────
+        async function showSettings() {
+            document.getElementById('settingsModal').style.display = 'flex';
+            try {
+                const res  = await fetch('/api/settings');
+                const data = await res.json();
+                document.getElementById('settingHost').value     = data.lm_studio_host;
+                document.getElementById('settingPort').value     = data.lm_studio_port;
+                document.getElementById('settingUsername').value = data.app_username;
+            } catch (e) { console.error('設定読み込みエラー:', e); }
+            fetchRagStatusModal();
+            loadRagConfig();
+        }
+
+        function hideSettings() {
+            document.getElementById('settingsModal').style.display = 'none';
+        }
+
+        async function saveSettings() {
+            const host     = document.getElementById('settingHost').value;
+            const port     = document.getElementById('settingPort').value;
+            const apiKey   = document.getElementById('settingApiKey').value;
+            const username = document.getElementById('settingUsername').value;
+            const password = document.getElementById('settingPassword').value;
+            try {
+                const res = await fetch('/api/update-settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        lm_studio_host: host,
+                        lm_studio_port: parseInt(port),
+                        lm_studio_api_key: apiKey,
+                        app_username: username,
+                        app_password: password,
+                    }),
+                });
+                if (res.ok) {
+                    alert('設定を更新しました。サーバーを再起動してください。');
+                    hideSettings();
+                    document.getElementById('lmUrl').textContent = `http://${host}:${port}`;
+                } else { alert('設定の更新に失敗しました'); }
+            } catch (e) { alert('設定の更新に失敗しました: ' + e.message); }
+        }
+
+        // ─── GraphRAG 検索モード設定 ──────────────────────────────────────
+        async function loadRagConfig() {
+            try {
+                const res  = await fetch('/api/rag/config');
+                const data = await res.json();
+                const sel = document.getElementById('ragSearchMode');
+                if (sel && data.search_mode) sel.value = data.search_mode;
+            } catch (e) { console.error('GraphRAG設定読み込みエラー:', e); }
+        }
+
+        async function saveRagConfig() {
+            const statusEl  = document.getElementById('ragConfigStatus');
+            const mode      = document.getElementById('ragSearchMode').value;
+            try {
+                const res  = await fetch('/api/rag/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ search_mode: mode }),
+                });
+                const data = await res.json();
+                if (data.error) {
+                    statusEl.textContent = `⚠️ ${data.error}`;
+                    statusEl.style.color = '#f87171';
+                } else {
+                    statusEl.textContent = `✅ 保存しました（モード: ${data.search_mode}）`;
+                    statusEl.style.color = '#4ade80';
+                    setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = '#888'; }, 4000);
+                }
+            } catch (e) {
+                statusEl.textContent = `⚠️ 保存失敗: ${e.message}`;
+                statusEl.style.color = '#f87171';
+            }
+        }
+
+        // ─── Function Calling ツール保存・読み込み ───────────────────────
+        async function loadSavedTools() {
+            try {
+                const res  = await fetch('/api/tools');
+                const data = await res.json();
+                if (!data.tools || data.tools.length === 0) return;
+                currentTools = data.tools;
+                document.getElementById('toolConfig').value = JSON.stringify(data.tools, null, 2);
+                const names = currentTools.map(t => t.function?.name || '?').join(', ');
+                document.getElementById('toolStatus').textContent = `✅ ${currentTools.length}件: ${names}`;
+            } catch (e) {
+                console.error('ツール読み込みエラー:', e);
+            }
+        }
+
+        function parseTools() {
+            const raw      = document.getElementById('toolConfig').value.trim();
+            const statusEl = document.getElementById('toolStatus');
+            if (!raw) {
+                currentTools = [];
+                statusEl.textContent = '⚠️ ツール未登録';
+                alert('ツール設定が空です');
+                return;
+            }
+            try {
+                const parsed = JSON.parse(raw);
+                if (!Array.isArray(parsed)) {
+                    alert('⚠️ 配列形式 [ {type:"function", ...} ] で入力してください。');
+                    return;
+                }
+                currentTools = parsed;
+                const names = currentTools.map(t => t.function?.name || '?').join(', ');
+                statusEl.textContent = `✅ ${currentTools.length}件: ${names}`;
+                document.getElementById('toolSaveStatus').textContent = '（未保存）';
+            } catch (e) {
+                alert('⚠️ JSON パースエラー: ' + e.message);
+            }
+        }
+
+        async function saveTools() {
+            const saveEl   = document.getElementById('toolSaveStatus');
+            const raw      = document.getElementById('toolConfig').value.trim();
+            const statusEl = document.getElementById('toolStatus');
+
+            // テキストエリアの内容をそのまま解析してから保存
+            let toolsToSave = [];
+            if (raw) {
+                try {
+                    const parsed = JSON.parse(raw);
+                    if (!Array.isArray(parsed)) {
+                        saveEl.textContent = '⚠️ 配列形式 [ {type:"function", ...} ] で入力してください';
+                        return;
+                    }
+                    toolsToSave = parsed;
+                    currentTools = parsed;
+                    const names = currentTools.map(t => t.function?.name || '?').join(', ');
+                    statusEl.textContent = `✅ ${currentTools.length}件: ${names}`;
+                } catch (e) {
+                    saveEl.textContent = `⚠️ JSON パースエラー: ${e.message}`;
+                    return;
+                }
+            }
+
+            try {
+                const res = await fetch('/api/tools', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tools: toolsToSave }),
+                });
+                const data = await res.json();
+                saveEl.textContent = toolsToSave.length > 0
+                    ? `✅ 保存しました（${data.count}件）`
+                    : '✅ ツール設定をクリアしました';
+                saveEl.style.color = '#4ade80';
+                setTimeout(() => { saveEl.textContent = ''; saveEl.style.color = '#888'; }, 3000);
+            } catch (e) {
+                saveEl.textContent = `⚠️ 保存失敗: ${e.message}`;
+            }
+        }
+
+        async function clearTools() {
+            if (!confirm('ツール設定を削除してもよろしいですか？')) return;
+            currentTools = [];
+            document.getElementById('toolConfig').value = '';
+            document.getElementById('toolStatus').textContent = '⚠️ ツール未登録';
+            try {
+                await fetch('/api/tools', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tools: [] }),
+                });
+                document.getElementById('toolSaveStatus').textContent = '';
+            } catch (e) {
+                console.error('ツールクリアエラー:', e);
+            }
+        }
+
+        // ─── RAG 操作 ───────────────────────────────────────────────────
+        function onRagToggle() {
+            ragEnabled = document.getElementById('ragToggle').checked;
+            const label = document.getElementById('ragToggleLabel');
+            label.textContent = ragEnabled ? 'オン' : 'オフ';
+            label.style.color = ragEnabled ? '#4ade80' : '#888';
+            if (ragEnabled) fetchRagStatusBadge();
+        }
+
+        async function fetchRagStatusBadge() {
+            const badge = document.getElementById('ragChunkBadge');
+            try {
+                const res  = await fetch('/api/rag/status');
+                if (!res.ok) return;
+                const data = await res.json();
+                badge.textContent = `${data.total_documents}件`;
+            } catch { badge.textContent = ''; }
+        }
+
+        async function fetchRagStatusModal() {
+            const el = document.getElementById('ragStatusModal');
+            el.textContent = '確認中...';
+            try {
+                const res  = await fetch('/api/rag/status');
+                if (!res.ok) { el.textContent = '⚠️ GraphRAG未初期化'; return; }
+                const data = await res.json();
+                const docs = data.documents && data.documents.length > 0
+                    ? data.documents.map(d => `• ${d}`).join('<br>')
+                    : '（なし）';
+                const mode = data.search_mode ? ` / モード: ${data.search_mode}` : '';
+                el.innerHTML = `🕸️ ${data.total_documents}件${mode}<br><span style="color:#555">${docs}</span>`;
+                document.getElementById('ragChunkBadge').textContent = `${data.total_documents}件`;
+            } catch { el.textContent = '⚠️ 取得失敗'; }
+        }
+
+        async function uploadRagFile(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const el = document.getElementById('ragStatusModal');
+            el.textContent = `⏳ アップロード中: ${file.name}`;
+            const form = new FormData();
+            form.append('file', file);
+            try {
+                const res  = await fetch('/api/rag/upload', { method: 'POST', body: form });
+                const data = await res.json();
+                if (data.success) {
+                    fetchRagStatusModal();
+                } else {
+                    el.textContent = `⚠️ ${data.message || data.error}`;
+                }
+            } catch (e) { el.textContent = `⚠️ アップロード失敗: ${e.message}`; }
+            event.target.value = '';
+        }
+
+        async function reindexRagDir() {
+            const el = document.getElementById('ragStatusModal');
+            el.textContent = '⏳ 再スキャン中...';
+            try {
+                const res  = await fetch('/api/rag/index-dir', { method: 'POST' });
+                const data = await res.json();
+                el.textContent = `✅ ${data.success}件成功 / ${data.total}件`;
+                fetchRagStatusModal();
+            } catch (e) { el.textContent = `⚠️ 失敗: ${e.message}`; }
+        }
+
+        // ─── ユーティリティ ─────────────────────────────────────────────
+        function toggleSidebar() {
+            const sidebar   = document.getElementById('sidebar');
+            const reopenBtn = document.getElementById('sidebar-reopen-btn');
+            sidebar.classList.toggle('collapsed');
+            reopenBtn.style.display = sidebar.classList.contains('collapsed') ? 'flex' : 'none';
+        }
+
+        function updateTemperatureDisplay() {
+            const slider  = document.getElementById('temperature');
+            const display = document.getElementById('temperatureValue');
+            slider.addEventListener('input', () => { display.textContent = slider.value; });
+        }
+
+        function handleKeyDown(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+            }
+        }
+
+        function autoResize(textarea) {
+            textarea.style.height = 'auto';
+            textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+        }
+    </script>
+    <button id="sidebar-reopen-btn" class="sidebar-reopen-btn" onclick="toggleSidebar()" title="サイドバーを表示">☰</button>
+</body>
+</html>
