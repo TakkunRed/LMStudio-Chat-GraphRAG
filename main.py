@@ -247,8 +247,9 @@ async def startup_event():
     try:
         cfg = load_rag_config()
         base_url = f"http://{os.getenv('LM_STUDIO_HOST', '127.0.0.1')}:{os.getenv('LM_STUDIO_PORT', '1234')}/v1"
-        # LLM モデルの優先順位: 環境変数 > rag_config.json > 自動検出
-        llm_model = os.getenv("LM_STUDIO_LLM_MODEL", "") or cfg.get("llm_model", "")
+        # LLM モデルの優先順位: rag_config.json（UI保存値）> 環境変数 > 自動検出
+        # rag_config.json を優先することで、設定画面での変更がサーバー再起動後も維持される
+        llm_model = cfg.get("llm_model", "") or os.getenv("LM_STUDIO_LLM_MODEL", "")
         rag_manager = GraphRAGManager(
             working_dir=str(BASE_DIR / "lightrag_db"),
             lm_studio_base_url=base_url,

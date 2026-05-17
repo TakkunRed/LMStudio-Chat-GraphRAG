@@ -230,7 +230,8 @@
                 </div>
                 <div class="form-group" style="margin-top:10px;">
                     <label>検索モード</label>
-                    <select id="ragSearchMode" class="sidebar-input" style="width:100%; padding:4px 8px;">
+                    <select id="ragSearchMode" class="sidebar-input" style="width:100%; padding:4px 8px;"
+                            onchange="onRagConfigChanged()">
                         <option value="hybrid">hybrid（推奨）— ローカル＋グローバルを統合</option>
                         <option value="local">local — エンティティ周辺の詳細検索</option>
                         <option value="global">global — ドキュメント全体のテーマ検索</option>
@@ -239,16 +240,18 @@
                 </div>
                 <div class="form-group" style="margin-top:10px;">
                     <label>GraphRAG 作成モデル <span style="color:#555;font-size:10px;">（インデックス構築に使うLLM）</span></label>
-                    <select id="ragLlmModel" class="sidebar-input" style="width:100%; padding:4px 8px;">
+                    <select id="ragLlmModel" class="sidebar-input" style="width:100%; padding:4px 8px;"
+                            onchange="onRagConfigChanged()">
                         <option value="">── 自動（LM Studio で選択中のモデル）</option>
                     </select>
                     <div style="font-size:10px; color:#555; margin-top:3px;">
-                        💡 デバッガーで最適なモデルを確認してから選択してください
+                        💡 変更後は必ず「💾 設定を保存」を押してください
                     </div>
                 </div>
                 <div class="form-group" style="margin-top:10px;">
                     <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
-                        <input type="checkbox" id="normalizeOnInsert" style="accent-color:#f0883e; width:14px; height:14px;">
+                        <input type="checkbox" id="normalizeOnInsert" style="accent-color:#f0883e; width:14px; height:14px;"
+                               onchange="onRagConfigChanged()">
                         <span>登録時テキスト前処理（1文1事実）</span>
                     </label>
                     <div style="font-size:10px; color:#555; margin-top:3px; padding-left:22px;">
@@ -257,7 +260,7 @@
                     </div>
                 </div>
                 <div style="display:flex; gap:6px; align-items:center; margin-top:6px; flex-wrap:wrap;">
-                    <button class="btn-small" onclick="saveRagConfig()">💾 設定を保存</button>
+                    <button class="btn-small" id="ragSaveBtn" onclick="saveRagConfig()">💾 設定を保存</button>
                     <a href="/graph" target="_blank"
                        style="display:inline-flex;align-items:center;gap:4px;padding:4px 10px;
                               background:#1a3a5c;border:1px solid #2a4a6c;border-radius:4px;
@@ -640,6 +643,17 @@
             } catch (e) { console.error('RAG LLM モデル取得エラー:', e); }
         }
 
+        // RAG 設定が変更されたときにボタンをハイライトする
+        function onRagConfigChanged() {
+            const btn = document.getElementById('ragSaveBtn');
+            if (btn) {
+                btn.style.background    = '#b45309';
+                btn.style.borderColor   = '#d97706';
+                btn.style.color         = '#fff';
+                btn.textContent         = '💾 設定を保存（未保存）';
+            }
+        }
+
         async function saveRagConfig() {
             const statusEl        = document.getElementById('ragConfigStatus');
             const mode            = document.getElementById('ragSearchMode').value;
@@ -660,6 +674,14 @@
                     const normalizeLabel = data.normalize_on_insert ? 'ON' : 'OFF';
                     statusEl.textContent = `✅ 保存しました（モード: ${data.search_mode} / モデル: ${modelLabel} / 前処理: ${normalizeLabel}）`;
                     statusEl.style.color = '#4ade80';
+                    // 保存完了 → ボタンを元のスタイルに戻す
+                    const btn = document.getElementById('ragSaveBtn');
+                    if (btn) {
+                        btn.style.background  = '';
+                        btn.style.borderColor = '';
+                        btn.style.color       = '';
+                        btn.textContent       = '💾 設定を保存';
+                    }
                     setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = '#888'; }, 5000);
                 }
             } catch (e) {

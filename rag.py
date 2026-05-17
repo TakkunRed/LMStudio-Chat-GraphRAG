@@ -612,6 +612,7 @@ class GraphRAGManager:
             payload: dict = {"messages": messages, "temperature": 0, "max_tokens": 2048}
             if llm_model and llm_model not in ("", "local-model"):
                 payload["model"] = llm_model
+            print(f"[GraphRAG LLM] リクエスト送信: model={llm_model or '（自動）'}, messages={len(messages)}")
 
             headers = {
                 "Authorization": f"Bearer {api_key}",
@@ -688,7 +689,11 @@ class GraphRAGManager:
                     if not resp.is_success:
                         print(f"[GraphRAG LLM Error] {resp.status_code}: {resp.text[:600]}")
                     resp.raise_for_status()
-                    content = resp.json()["choices"][0]["message"]["content"]
+                    resp_json = resp.json()
+                    actual_model = resp_json.get("model", "")
+                    if actual_model and actual_model != llm_model:
+                        print(f"[GraphRAG LLM] ⚠️ 要求モデル={llm_model or '（自動）'} / 実際に使用={actual_model}")
+                    content = resp_json["choices"][0]["message"]["content"]
                     return _fix_llm_output(content)  # フィールド数超過による WARNING を抑制
             finally:
                 _llm_semaphore.release()
