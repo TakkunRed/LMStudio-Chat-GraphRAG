@@ -237,8 +237,27 @@
                         <option value="naive">naive — シンプルなベクトル検索</option>
                     </select>
                 </div>
+                <div class="form-group" style="margin-top:10px;">
+                    <label>GraphRAG 作成モデル <span style="color:#555;font-size:10px;">（インデックス構築に使うLLM）</span></label>
+                    <select id="ragLlmModel" class="sidebar-input" style="width:100%; padding:4px 8px;">
+                        <option value="">── 自動（LM Studio で選択中のモデル）</option>
+                    </select>
+                    <div style="font-size:10px; color:#555; margin-top:3px;">
+                        💡 デバッガーで最適なモデルを確認してから選択してください
+                    </div>
+                </div>
+                <div class="form-group" style="margin-top:10px;">
+                    <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                        <input type="checkbox" id="normalizeOnInsert" style="accent-color:#f0883e; width:14px; height:14px;">
+                        <span>登録時テキスト前処理（1文1事実）</span>
+                    </label>
+                    <div style="font-size:10px; color:#555; margin-top:3px; padding-left:22px;">
+                        📄→🔧 「AはBとCの息子」→「AはBの息子」「AはCの息子」に分解してから登録。<br>
+                        精度が向上しますが、処理時間が増加します。設定後は再登録が必要です。
+                    </div>
+                </div>
                 <div style="display:flex; gap:6px; align-items:center; margin-top:6px; flex-wrap:wrap;">
-                    <button class="btn-small" onclick="saveRagConfig()">💾 検索モードを保存</button>
+                    <button class="btn-small" onclick="saveRagConfig()">💾 設定を保存</button>
                     <a href="/graph" target="_blank"
                        style="display:inline-flex;align-items:center;gap:4px;padding:4px 10px;
                               background:#1a3a5c;border:1px solid #2a4a6c;border-radius:4px;
@@ -586,33 +605,62 @@
             } catch (e) { alert('設定の更新に失敗しました: ' + e.message); }
         }
 
-        // ─── GraphRAG 検索モード設定 ──────────────────────────────────────
+        // ─── GraphRAG 設定（検索モード・LLM モデル） ────────────────────────
         async function loadRagConfig() {
             try {
                 const res  = await fetch('/api/rag/config');
                 const data = await res.json();
                 const sel = document.getElementById('ragSearchMode');
                 if (sel && data.search_mode) sel.value = data.search_mode;
+
+                // 前処理チェックボックス
+                const chk = document.getElementById('normalizeOnInsert');
+                if (chk) chk.checked = !!data.normalize_on_insert;
+
+                // LLM モデルドロップダウンを最新モデルリストで更新してから選択値を復元
+                await populateRagLlmModels(data.llm_model || '');
             } catch (e) { console.error('GraphRAG設定読み込みエラー:', e); }
         }
 
+        async function populateRagLlmModels(selectedModel) {
+            const sel = document.getElementById('ragLlmModel');
+            if (!sel) return;
+            // 自動オプションだけ残してリセット
+            sel.innerHTML = '<option value="">── 自動（LM Studio で選択中のモデル）</option>';
+            try {
+                const res  = await fetch('/api/models');
+                const data = await res.json();
+                (data.models || []).forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m.id;
+                    opt.textContent = m.id;
+                    sel.appendChild(opt);
+                });
+                if (selectedModel) sel.value = selectedModel;
+            } catch (e) { console.error('RAG LLM モデル取得エラー:', e); }
+        }
+
         async function saveRagConfig() {
-            const statusEl  = document.getElementById('ragConfigStatus');
-            const mode      = document.getElementById('ragSearchMode').value;
+            const statusEl        = document.getElementById('ragConfigStatus');
+            const mode            = document.getElementById('ragSearchMode').value;
+            const llmModel        = document.getElementById('ragLlmModel')?.value ?? '';
+            const normalizeOnInsert = document.getElementById('normalizeOnInsert')?.checked ?? false;
             try {
                 const res  = await fetch('/api/rag/config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ search_mode: mode }),
+                    body: JSON.stringify({ search_mode: mode, llm_model: llmModel, normalize_on_insert: normalizeOnInsert }),
                 });
                 const data = await res.json();
                 if (data.error) {
                     statusEl.textContent = `⚠️ ${data.error}`;
                     statusEl.style.color = '#f87171';
                 } else {
-                    statusEl.textContent = `✅ 保存しました（モード: ${data.search_mode}）`;
+                    const modelLabel    = data.llm_model ? data.llm_model : '自動';
+                    const normalizeLabel = data.normalize_on_insert ? 'ON' : 'OFF';
+                    statusEl.textContent = `✅ 保存しました（モード: ${data.search_mode} / モデル: ${modelLabel} / 前処理: ${normalizeLabel}）`;
                     statusEl.style.color = '#4ade80';
-                    setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = '#888'; }, 4000);
+                    setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = '#888'; }, 5000);
                 }
             } catch (e) {
                 statusEl.textContent = `⚠️ 保存失敗: ${e.message}`;
@@ -746,8 +794,9 @@
                 const docs = data.documents && data.documents.length > 0
                     ? data.documents.map(d => `• ${d}`).join('<br>')
                     : '（なし）';
-                const mode = data.search_mode ? ` / モード: ${data.search_mode}` : '';
-                el.innerHTML = `🕸️ ${data.total_documents}件${mode}<br><span style="color:#555">${docs}</span>`;
+                const mode  = data.search_mode ? ` / モード: ${data.search_mode}` : '';
+                const model = data.llm_model   ? ` / LLM: ${data.llm_model}` : '';
+                el.innerHTML = `🕸️ ${data.total_documents}件${mode}${model}<br><span style="color:#555">${docs}</span>`;
                 document.getElementById('ragChunkBadge').textContent = `${data.total_documents}件`;
             } catch { el.textContent = '⚠️ 取得失敗'; }
         }

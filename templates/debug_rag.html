@@ -64,6 +64,7 @@
   .form-group { display: flex; flex-direction: column; gap: 6px; }
   .form-group label { font-size: 0.82rem; color: #8b949e; }
   .form-group input[type="number"],
+  .form-group select,
   .form-group textarea {
     background: #0d1117;
     border: 1px solid #30363d;
@@ -75,8 +76,20 @@
     outline: none;
     transition: border-color .15s;
   }
+  .form-group select { cursor: pointer; appearance: auto; }
   .form-group input[type="number"]:focus,
+  .form-group select:focus,
   .form-group textarea:focus { border-color: #58a6ff; }
+  .model-badge {
+    display: inline-block;
+    background: #1f6feb22;
+    color: #58a6ff;
+    border: 1px solid #1f6feb44;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 0.72rem;
+    font-family: monospace;
+  }
   .form-group textarea { resize: vertical; min-height: 140px; }
   .form-group .hint { font-size: 0.75rem; color: #6e7681; }
 
@@ -342,9 +355,26 @@
     <h2>実行設定</h2>
 
     <div class="form-group">
+      <label>LLM モデル</label>
+      <select id="modelSelect">
+        <option value="">⏳ モデル読み込み中...</option>
+      </select>
+      <span class="hint" id="modelHint">LM Studio にロードされているモデルから選択</span>
+    </div>
+
+    <div class="form-group">
       <label>処理するチャンク数（上限）</label>
       <input type="number" id="maxChunks" value="3" min="1" max="20">
       <span class="hint">先頭からこの件数だけ LLM に送信します。多いと時間がかかります。</span>
+    </div>
+
+    <div class="form-group">
+      <label>前処理：複合文 → 単純文</label>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 0">
+        <input type="checkbox" id="normalizeChunks" style="width:16px;height:16px;cursor:pointer;accent-color:#f0883e">
+        <span style="font-size:0.85rem;color:#c9d1d9">有効にする</span>
+      </label>
+      <span class="hint">「AとBのC」などの複合構文を LLM で1文1関係に書き換えてから抽出します。LLM 呼び出しが1チャンクあたり+1回増えます。</span>
     </div>
 
     <button class="btn-run" id="runBtn" onclick="runDebug()">▶ 抽出を実行</button>
@@ -417,6 +447,47 @@ function readFile(file) {
   }
 }
 
+// ─── モデル一覧の読み込み ────────────────────────────────────────────
+async function loadModels() {
+  const sel = document.getElementById('modelSelect');
+  const hint = document.getElementById('modelHint');
+  try {
+    const resp = await fetch('/api/models');
+    const data = await resp.json();
+    const models = data.models || [];
+    sel.innerHTML = '';
+
+    // デフォルト選択肢（空 = RAGマネージャーのデフォルトモデル）
+    const defOpt = document.createElement('option');
+    defOpt.value = '';
+    defOpt.textContent = '── RAG デフォルト（起動時検出モデル）';
+    sel.appendChild(defOpt);
+
+    models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = m.id;
+      sel.appendChild(opt);
+    });
+
+    // LM Studio に 1 台しかロードされていない場合は自動選択
+    if (models.length === 1) {
+      sel.value = models[0].id;
+      hint.textContent = `✓ ${models[0].id} を自動選択`;
+    } else if (models.length > 1) {
+      hint.textContent = `${models.length} 件のモデルが利用可能`;
+    } else {
+      hint.textContent = 'LM Studio からモデル情報を取得できませんでした';
+    }
+  } catch (e) {
+    sel.innerHTML = '<option value="">（モデル取得失敗 – デフォルト使用）</option>';
+    hint.textContent = `取得エラー: ${e.message}`;
+  }
+}
+
+// ページ読み込み時にモデル一覧を取得
+loadModels();
+
 // ─── デバッグ実行 ────────────────────────────────────────────────────
 async function runDebug() {
   const text = textInput.value.trim();
@@ -428,6 +499,8 @@ async function runDebug() {
   const maxChars   = parseInt(document.getElementById('maxChars').value) || 200;
   const overlap    = parseInt(document.getElementById('overlapSentences').value) || 1;
   const maxChunks  = parseInt(document.getElementById('maxChunks').value) || 3;
+  const model      = document.getElementById('modelSelect').value;
+  const normalize  = document.getElementById('normalizeChunks').checked;
 
   const resultsEl = document.getElementById('results');
   resultsEl.innerHTML = '';
@@ -448,6 +521,8 @@ async function runDebug() {
         max_chars: maxChars,
         overlap_sentences: overlap,
         max_chunks: maxChunks,
+        model: model,
+        normalize: normalize,
       }),
     });
 
@@ -510,11 +585,17 @@ function appendChunkCard(evt) {
   const entityCount = evt.entities.length;
   const relCount    = evt.relations.length;
 
+  const usedModel = document.getElementById('modelSelect').value;
+  const modelLabel = usedModel
+    ? `<span class="model-badge">${escHtml(usedModel)}</span>`
+    : `<span class="model-badge">default</span>`;
+
   card.innerHTML = `
     <div class="card-header">
       <span class="badge">チャンク ${evt.chunk_idx + 1} / ${evt.total_chunks}</span>
       <span class="meta">${evt.tokens} tokens · ${evt.chunk_text.length} 文字</span>
-      <span class="elapsed">⏱ ${evt.elapsed_sec}s</span>
+      ${modelLabel}
+      <span class="elapsed">⏱ ${evt.normalize_elapsed_sec != null ? `前処理 ${evt.normalize_elapsed_sec}s + ` : ''}抽出 ${evt.elapsed_sec}s</span>
     </div>
     <div class="card-body">
 
@@ -522,12 +603,25 @@ function appendChunkCard(evt) {
       <div class="section">
         <button class="section-toggle open" onclick="toggleSection(this)">
           <span class="icon">▶</span>
-          <span class="label">📄 チャンクテキスト</span>
+          <span class="label">📄 チャンクテキスト（元）</span>
         </button>
         <div class="section-content open">
           <div class="text-block highlight-chunk">${escHtml(evt.chunk_text)}</div>
         </div>
       </div>
+
+      <!-- 前処理後テキスト（normalize=true かつ変換があった場合のみ表示） -->
+      ${evt.normalized_text != null ? `
+      <div class="section">
+        <button class="section-toggle open" onclick="toggleSection(this)">
+          <span class="icon">▶</span>
+          <span class="label">🔧 前処理後テキスト <span style="color:#f0883e;font-size:0.75rem;font-weight:normal">複合文 → 単純文</span></span>
+        </button>
+        <div class="section-content open">
+          <div class="text-block" style="border-left:3px solid #f0883e;white-space:pre-wrap">${escHtml(evt.normalized_text)}</div>
+        </div>
+      </div>
+      ` : ''}
 
       <!-- LLM応答（常に開く） -->
       <div class="section">
