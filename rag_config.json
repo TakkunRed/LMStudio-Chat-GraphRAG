@@ -1,3 +1,5 @@
 {
-  "search_mode": "hybrid"
+  "search_mode": "hybrid",
+  "llm_model": "llama-3.3-8b-instruct",
+  "normalize_on_insert": true
 }

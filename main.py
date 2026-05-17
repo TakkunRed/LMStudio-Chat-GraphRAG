@@ -2,9 +2,12 @@
 LM Studio Chat - FastAPI アプリケーション
 """
 
+import csv
 import httpx
+import io
 import json
 import os
+import re
 import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -23,6 +26,184 @@ from pydantic import BaseModel
 
 import config
 from rag import GraphRAGManager
+
+
+# ─── GraphRAG コンテキスト整形 ───────────────────────────────────────────
+
+def _format_rag_context(raw_context: str) -> str:
+    """
+    LightRAG の only_need_context=True が返すコンテキストを、
+    チャット LLM が読みやすい自然言語テキストに変換する。
+
+    LightRAG (新形式) は以下のような JSON Lines ブロックを返す:
+      Knowledge Graph Data (Entity):
+      ```json
+      {"entity": "...", "type": "...", "description": "..."}
+      ...
+      ```
+      Knowledge Graph Data (Relation):
+      ```json
+      {"src_id": "...", "tgt_id": "...", "description": "...", "keywords": "...", "weight": ...}
+      ...
+      ```
+      Knowledge Graph Data (Source):
+      ```json
+      {"id": "...", "content": "..."}
+      ...
+      ```
+
+    旧形式 (-----Entities-----, CSV) にも対応する。
+    """
+
+    # ================================================================
+    # ① JSON Lines 形式（新形式）を検出してパース
+    # ================================================================
+    def _extract_block(label_pattern: str) -> list[dict]:
+        """'Knowledge Graph Data (Label):' に続く ```json ブロックをパース"""
+        m = re.search(
+            label_pattern + r"[^\n]*\n+```(?:json)?\s*\n(.*?)```",
+            raw_context, re.DOTALL | re.IGNORECASE,
+        )
+        if not m:
+            return []
+        block = m.group(1).strip()
+        rows: list[dict] = []
+        for line in block.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        return rows
+
+    entity_rows   = _extract_block(r"Knowledge Graph Data\s*\(Entity\)")
+    relation_rows = _extract_block(r"Knowledge Graph Data\s*\(Relation\)")
+    source_rows   = _extract_block(r"Knowledge Graph Data\s*\(Source\)")
+    report_rows   = _extract_block(r"Knowledge Graph Data\s*\(Report\)")
+
+    result_parts: list[str] = []
+
+    if entity_rows:
+        result_parts.append("【エンティティ（登場人物・概念）】")
+        for row in entity_rows:
+            entity = str(row.get("entity") or "").strip()
+            etype  = str(row.get("type")   or "").strip()
+            desc   = str(row.get("description") or "").strip()
+            s = f"・{entity}"
+            if etype:
+                s += f"（{etype}）"
+            if desc:
+                s += f": {desc}"
+            result_parts.append(s)
+
+    if relation_rows:
+        result_parts.append("\n【関係性（ source → target: 説明 ）】")
+        for row in relation_rows:
+            # フィールド名が src_id/tgt_id の場合と source/target の場合がある
+            src  = str(row.get("src_id")  or row.get("source") or "").strip()
+            tgt  = str(row.get("tgt_id")  or row.get("target") or "").strip()
+            desc = str(row.get("description") or "").strip()
+            kw   = str(row.get("keywords")    or "").strip()
+            s = f"・{src} → {tgt}: {desc}"
+            if kw:
+                s += f"（キーワード: {kw}）"
+            result_parts.append(s)
+
+    if report_rows:
+        result_parts.append("\n【コミュニティ要約】")
+        for row in report_rows:
+            report = str(row.get("report") or row.get("content") or "").strip()
+            if report:
+                result_parts.append(f"・{report[:400]}")
+
+    if source_rows:
+        result_parts.append("\n【参照テキスト（原文抜粋）】")
+        for row in source_rows[:5]:
+            content = str(row.get("content") or "").strip()
+            if content:
+                result_parts.append(f"・{content[:300]}")
+
+    if result_parts:
+        formatted = "\n".join(result_parts)
+        print(f"[GraphRAG] コンテキスト整形(JSON形式): {len(raw_context)}文字 → {len(formatted)}文字")
+        return formatted
+
+    # ================================================================
+    # ② 旧形式 (-----Entities-----, CSV) へのフォールバック
+    # ================================================================
+    sections: dict[str, str] = {}
+    current_key: str | None = None
+    current_lines: list[str] = []
+
+    for line in raw_context.split("\n"):
+        m = re.match(r"^-{2,}\s*(\w+)\s*-{2,}$", line.strip())
+        if m:
+            if current_key is not None:
+                sections[current_key] = "\n".join(current_lines).strip()
+            current_key = m.group(1)
+            current_lines = []
+        else:
+            if current_key is not None:
+                current_lines.append(line)
+    if current_key is not None:
+        sections[current_key] = "\n".join(current_lines).strip()
+
+    def _extract_csv_block(text: str) -> str:
+        m = re.search(r"```(?:csv)?\s*\n(.*?)```", text, re.DOTALL)
+        return m.group(1).strip() if m else text.strip()
+
+    csv_parts: list[str] = []
+
+    for sec_key, label, src_col, tgt_col in [
+        ("Entities",      "【エンティティ】",   None,     None),
+        ("Relationships", "【関係性】",          "source", "target"),
+        ("Reports",       "【コミュニティ要約】", None,    None),
+        ("Sources",       "【参照テキスト】",    None,     None),
+    ]:
+        if sec_key not in sections:
+            continue
+        csv_text = _extract_csv_block(sections[sec_key])
+        try:
+            reader = csv.DictReader(io.StringIO(csv_text))
+            rows = [r for r in reader if any((v or "").strip() for v in r.values())]
+            if not rows:
+                continue
+            csv_parts.append(f"\n{label}")
+            for row in rows[:50]:
+                if sec_key == "Entities":
+                    entity = (row.get("entity") or "").strip().strip('"')
+                    etype  = (row.get("type")   or "").strip().strip('"')
+                    desc   = (row.get("description") or "").strip().strip('"')
+                    s = f"・{entity}"
+                    if etype: s += f"（{etype}）"
+                    if desc:  s += f": {desc}"
+                    csv_parts.append(s)
+                elif sec_key == "Relationships":
+                    src  = (row.get(src_col or "source") or "").strip().strip('"')
+                    tgt  = (row.get(tgt_col or "target") or "").strip().strip('"')
+                    desc = (row.get("description") or "").strip().strip('"')
+                    kw   = (row.get("keywords") or "").strip().strip('"')
+                    s = f"・{src} → {tgt}: {desc}"
+                    if kw: s += f"（キーワード: {kw}）"
+                    csv_parts.append(s)
+                else:
+                    content = (row.get("report") or row.get("content") or "").strip().strip('"')
+                    if content:
+                        csv_parts.append(f"・{content[:300]}")
+        except Exception:
+            csv_parts.append(f"{label}\n" + csv_text[:300])
+
+    if csv_parts:
+        formatted = "\n".join(csv_parts)
+        print(f"[GraphRAG] コンテキスト整形(CSV形式): {len(raw_context)}文字 → {len(formatted)}文字")
+        return formatted
+
+    # どちらにも該当しない場合はそのまま返す
+    print("[GraphRAG] コンテキスト整形: 既知フォーマットなし、生データをそのまま使用")
+    return raw_context
+
 
 # ─── アプリケーション設定 ───────────────────────────────────────────────
 
@@ -49,10 +230,14 @@ def load_rag_config() -> dict:
     if RAG_CONFIG_FILE.exists():
         try:
             cfg = json.loads(RAG_CONFIG_FILE.read_text(encoding="utf-8"))
-            return {"search_mode": cfg.get("search_mode", _SEARCH_MODE_DEFAULT)}
+            return {
+                "search_mode":       cfg.get("search_mode", _SEARCH_MODE_DEFAULT),
+                "llm_model":         cfg.get("llm_model", ""),
+                "normalize_on_insert": cfg.get("normalize_on_insert", False),
+            }
         except Exception:
             pass
-    return {"search_mode": _SEARCH_MODE_DEFAULT}
+    return {"search_mode": _SEARCH_MODE_DEFAULT, "llm_model": "", "normalize_on_insert": False}
 
 rag_manager: GraphRAGManager | None = None
 
@@ -62,14 +247,17 @@ async def startup_event():
     try:
         cfg = load_rag_config()
         base_url = f"http://{os.getenv('LM_STUDIO_HOST', '127.0.0.1')}:{os.getenv('LM_STUDIO_PORT', '1234')}/v1"
+        # LLM モデルの優先順位: 環境変数 > rag_config.json > 自動検出
+        llm_model = os.getenv("LM_STUDIO_LLM_MODEL", "") or cfg.get("llm_model", "")
         rag_manager = GraphRAGManager(
             working_dir=str(BASE_DIR / "lightrag_db"),
             lm_studio_base_url=base_url,
-            llm_model=os.getenv("LM_STUDIO_LLM_MODEL", ""),
+            llm_model=llm_model,
             embedding_model=os.getenv("LIGHTRAG_EMBED_MODEL", "nomic-embed-text"),
             embedding_dim=int(os.getenv("LIGHTRAG_EMBED_DIM", "768")),
             api_key=os.getenv("LM_STUDIO_API_KEY", "lm-studio"),
             search_mode=cfg["search_mode"],
+            normalize_on_insert=cfg.get("normalize_on_insert", False),
         )
         await rag_manager.initialize()
         print(f"[GraphRAG] 初期化完了 - {rag_manager.get_status()}")
@@ -334,21 +522,39 @@ async def api_chat(request: Request):
         if user_query:
             hits = await rag_manager.search(user_query)
             if hits:
-                context_text = "\n\n".join(h["content"] for h in hits)
+                # only_need_context=True が返す CSV を読みやすい箇条書きに変換
+                raw_context  = "\n\n".join(h["content"] for h in hits)
+                context_text = _format_rag_context(raw_context)
                 rag_system = {
                     "role": "system",
                     "content": (
-                        "以下の GraphRAG 検索結果を参考に回答してください。"
-                        "情報が不足する場合は、その旨を伝えてください。\n\n"
+                        "[STRICT INSTRUCTION]\n"
+                        "Answer the user's question using ONLY the knowledge graph data provided below.\n"
+                        "The data lists:\n"
+                        "  - 【エンティティ】: people, places, concepts with their descriptions\n"
+                        "  - 【関係性】: directed relationships in the form 'A → B: description'\n"
+                        "    (meaning A is related to B as described; e.g. '孫悟空 → 孫悟飯: 父子関係' means "
+                        "孫悟空 is the parent of 孫悟飯)\n"
+                        "  - 【参照テキスト】: original text excerpts\n\n"
+                        "Rules:\n"
+                        "1. Use ONLY facts explicitly listed in the data below.\n"
+                        "2. Relationship entries '孫悟空 → 孫悟飯: 父子関係' mean 孫悟空 is the PARENT "
+                        "and 孫悟飯 is the CHILD. Read directionality carefully.\n"
+                        "3. Do NOT use your training knowledge or prior information about the topic.\n"
+                        "4. If the answer is not in the data, say '提供されたデータに記載がありません'.\n"
+                        "5. Do NOT infer or guess relationships not explicitly stated.\n\n"
+                        "【知識グラフデータ】\n"
                         f"{context_text}"
                     ),
                 }
+                # 既存のシステムメッセージがあれば RAG コンテキストを先頭に追加
                 messages = [rag_system] + messages
                 rag_sources = [{"source": h["source"], "score": h["score"]} for h in hits]
 
     assistant_reply = await chat_with_tools(
         messages=messages,
         tools=tools,
+        model=model,
         temperature=temperature,
         max_tokens=max_tokens,
     )
@@ -390,6 +596,7 @@ async def call_mcp_tool(tool_name: str, tool_args: dict) -> str:
 async def chat_with_tools(
     messages: list[dict],
     tools: Optional[list[dict]] = None,
+    model: str = "",
     temperature: float = 0.7,
     max_tokens: int = 8192,
     max_tool_iterations: int = 5
@@ -413,6 +620,8 @@ async def chat_with_tools(
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if model:
+            payload["model"] = model
         if tool_definitions:
             payload["tools"] = tool_definitions
             payload["tool_choice"] = "auto"
@@ -614,13 +823,16 @@ async def rag_get_config(request: Request):
         raise HTTPException(status_code=401, detail="認証が必要です")
     cfg = load_rag_config()
     if rag_manager:
-        cfg["search_mode"] = rag_manager.search_mode
+        status = rag_manager.get_status()
+        cfg["search_mode"]       = rag_manager.search_mode
+        cfg["llm_model"]         = status.get("llm_model", "")
+        cfg["normalize_on_insert"] = status.get("normalize_on_insert", False)
     return JSONResponse(cfg)
 
 
 @app.post("/api/rag/config")
 async def rag_save_config(request: Request):
-    """GraphRAG 検索モードを保存"""
+    """GraphRAG 設定（検索モード・LLM モデル）を保存"""
     session = check_auth(request)
     if not session:
         raise HTTPException(status_code=401, detail="認証が必要です")
@@ -630,11 +842,32 @@ async def rag_save_config(request: Request):
     if mode not in {"naive", "local", "global", "hybrid"}:
         return JSONResponse({"error": "search_mode は naive/local/global/hybrid のいずれかです"}, status_code=400)
 
-    RAG_CONFIG_FILE.write_text(json.dumps({"search_mode": mode}, indent=2), encoding="utf-8")
+    llm_model        = str(body.get("llm_model", "")).strip()
+    normalize_on_insert = bool(body.get("normalize_on_insert", False))
+
+    # rag_config.json に保存
+    RAG_CONFIG_FILE.write_text(
+        json.dumps(
+            {"search_mode": mode, "llm_model": llm_model, "normalize_on_insert": normalize_on_insert},
+            indent=2, ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    # 実行中の rag_manager に反映
     if rag_manager:
         rag_manager.search_mode = mode
+        rag_manager._config["normalize_on_insert"] = normalize_on_insert
+        current_model = rag_manager.get_status().get("llm_model", "")
+        if llm_model != current_model:
+            await rag_manager.set_llm_model(llm_model)
 
-    return JSONResponse({"status": "saved", "search_mode": mode})
+    return JSONResponse({
+        "status": "saved",
+        "search_mode": mode,
+        "llm_model": llm_model,
+        "normalize_on_insert": normalize_on_insert,
+    })
 
 
 @app.get("/api/rag/status")
@@ -897,6 +1130,8 @@ class DebugExtractRequest(BaseModel):
     max_chars: int = 200
     overlap_sentences: int = 1
     max_chunks: int = 5
+    model: str = ""        # 空 = RAG マネージャーのデフォルトモデル
+    normalize: bool = False  # True = 抽出前に複合文 → 単純文に変換
 
 
 @app.post("/api/rag/debug/read-pdf")
@@ -942,6 +1177,8 @@ async def api_rag_debug_run(request: Request, body: DebugExtractRequest):
                 max_chars=max_chars,
                 overlap_sentences=overlap,
                 max_chunks=max_chk,
+                model=body.model.strip(),
+                normalize=body.normalize,
             ):
                 yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
         except Exception as e:

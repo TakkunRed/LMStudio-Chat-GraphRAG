@@ -73,6 +73,166 @@ def _patch_lightrag_handlers() -> None:
 _patch_lightrag_handlers()
 
 
+def _customize_extraction_prompts() -> None:
+    """
+    LightRAG の entity_extraction_system_prompt 先頭に幻覚抑制ルールを注入する。
+
+    【設計方針】
+    ① ドメイン非依存 ── 技術文書・ニュース・小説・仕様書など任意の入力に適用できる
+                        汎用的なルールのみを記述し、特定のジャンルや固有名詞は使わない
+    ② 英語で記述 ── llama-3.1-8b クラスの小規模モデルは英語の命令への従順性が
+                     日本語より高い（出力言語とは無関係）
+    ③ プロンプト先頭に配置 ── アテンションはプロンプト末尾ほど低下するため、
+                               最重要ルールを先頭に置く
+    ④ 短く番号付き ── 長文ルールは小規模モデルが途中を読み飛ばすため、
+                       1ルール1文の箇条書きにする
+
+    【注入するルールの根拠】
+    RULE 1 (NO HALLUCINATION)
+        有名な固有名詞（人名・地名・作品名など）を含む文書では、
+        LLM が事前学習知識をテキストに投影する（幻覚）。
+        「テキストに書かれていないことは追加するな」と明示することで抑制する。
+
+    RULE 2 (MINIMAL DESCRIPTION)
+        description を長く書こうとするほど幻覚が増える。
+        テキストの言葉を使った1〜2文に制限することで幻覚の機会を減らす。
+
+    RULE 3 (NO INFERRED RELATIONS)
+        「AとBの息子C」からLLMは「AとBは夫婦」を推論して追加しがち。
+        テキストに明記されていない関係は生成禁止と明示する。
+
+    RULE 4 (EXPLICIT RELATIONS ONLY)
+        共起（同じ文に登場する）だけで relation を生成するモデルへの対策。
+        テキストで明示的に関係づけられている場合のみ relation を生成する。
+
+    RULE 5 (DIRECTIONAL KEYWORDS)
+        「兄弟」「家族」「関係」など方向性のない語は使わず、
+        「兄」「弟子」「雇用主」など方向性のある語を要求する。
+    """
+    from lightrag.prompt import PROMPTS
+
+    prefix = """\
+=== CRITICAL EXTRACTION RULES (highest priority — follow before all other instructions) ===
+RULE 1 [NO HALLUCINATION]:
+  Extract ONLY information that is EXPLICITLY written in the input text.
+  Do NOT add any fact from memory, training data, or inference — even if you know the topic well.
+RULE 2 [ENTITY DESCRIPTION]:
+  Entity description = direct paraphrase from the input text only (1-2 sentences max).
+  Do NOT elaborate, speculate, or add background knowledge about the entity.
+RULE 3 [RELATION DESCRIPTION — REQUIRED, NEVER OMIT]:
+  Every relation MUST have a description (the 5th field). Never leave it empty.
+  Write 1 sentence from the input text explaining how/why the relation exists.
+  Correct format: relation<|#|>A<|#|>B<|#|>keywords<|#|>one-sentence description from text
+  Wrong format:   relation<|#|>A<|#|>B<|#|>keywords          ← missing description field
+RULE 4 [NO INFERRED RELATIONS]:
+  "C is the child of A and B" → extract C→A and C→B ONLY.
+  Do NOT infer A→B (e.g. spouse/partner) — that relationship is NOT stated in the text.
+RULE 5 [EXPLICIT RELATIONS ONLY]:
+  Only create a relation when the text EXPLICITLY states a connection between two entities.
+  Two entities appearing near each other is NOT sufficient to create a relation.
+RULE 6 [DIRECTIONAL KEYWORDS — 1 to 2 words only]:
+  Keywords must describe the relationship type, not the entity type.
+  GOOD: "son", "older brother", "teacher", "disciple", "spouse", "employer"
+  BAD : "family relationship", "sibling", "person", "human", "related", "associated"
+  NOTE: Entity types such as "person", "organization", "concept" are NEVER valid keywords.
+RULE 7 [CO-PARENT PATTERN — most common mistake]:
+  When text says "C is son/daughter of A and B":
+  - A and B are CO-PARENTS of C. They are NOT parent and child of each other.
+  - A's description: "A is C's father/mother" — NEVER "A is parent of C and B"
+  - B's description: "B is C's father/mother" — NEVER "B is parent of C and A"
+  WRONG: 孫悟空's description = "孫悟飯とチチの父親" (implies チチ is also 孫悟空's child)
+  RIGHT: 孫悟空's description = "孫悟飯の父親"
+RULE 8 [EXTRACT ALL STATED RELATIONS]:
+  Extract a relation for EVERY connection explicitly described in the text.
+  If an entity description says "A is B's older brother", also output:
+    relation<|#|>A<|#|>B<|#|>older brother<|#|>A is B's older brother.
+  Do not rely solely on entity descriptions — relations must also be in the relation list.
+RULE 9 [RECIPROCAL ROLE INVERSION — most common mistake for sibling/parent relationships]:
+  When text says "A is B's [role]", entity B has the INVERSE role relative to A.
+  You MUST use the inverse when writing B's entity description.
+  Reciprocal role pairs (use these conversions):
+    弟 (younger brother) ↔ 兄 (older brother)
+    妹 (younger sister)  ↔ 姉 (older sister)
+    息子 (son)   → 父 (father) or 母 (mother)
+    娘 (daughter)→ 父 (father) or 母 (mother)
+    弟子 (disciple) ↔ 師匠 (teacher/master)
+    部下 (subordinate) ↔ 上司 (superior)
+  Step-by-step example:
+    Text: "孫悟天は孫悟飯の弟"
+    → role is 弟, so 孫悟天 is 孫悟飯's YOUNGER brother
+    → 孫悟飯 has the INVERSE role = 兄 (older brother)
+    WRONG description for 孫悟飯: "孫悟飯は孫悟天の弟" ← same role, not inverted!
+    RIGHT description for 孫悟飯: "孫悟飯は孫悟天の兄" ← correctly inverted
+=== END CRITICAL RULES ===
+
+"""
+
+    key = "entity_extraction_system_prompt"
+    if key in PROMPTS and "CRITICAL EXTRACTION RULES" not in PROMPTS[key]:
+        PROMPTS[key] = prefix + PROMPTS[key]
+        print("[GraphRAG] 抽出プロンプトの先頭に幻覚抑制ルール（9条）を注入しました")
+
+    # ── エンティティ説明要約プロンプトにも注入 ────────────────────────────
+    # summarize_entity_descriptions は複数チャンクの説明を1文に統合する LLM 呼び出し。
+    # ここで "AとBの父親" のような誤合成が起きるため、専用ルールを注入する。
+    #
+    # 【誤合成の例】
+    #   入力説明①: "孫悟空は孫悟飯の父親"
+    #   入力説明②: "孫悟空はチチの夫"
+    #   → LLM が "統合" しようとして "孫悟飯とチチの父親" と圧縮してしまう
+    #
+    # 【防止ルール】
+    #   RULE A: 関係は絶対に圧縮するな。"父of孫悟飯" と "夫of チチ" は別の文として書け。
+    #   RULE B: "AとBのC" 形式の誰が子で誰が妻か曖昧な表現を禁止する。
+    summ_key = "summarize_entity_descriptions"
+    summ_prefix = """\
+=== CRITICAL MERGE RULES (follow before all other instructions) ===
+RULE A [NEVER COMPRESS RELATIONS]:
+  Keep every relationship as a SEPARATE sentence. Do NOT merge different relationships into one.
+  WRONG: "孫悟空は孫悟飯とチチの父親" (merges parent + spouse into one phrase)
+  RIGHT: "孫悟空は孫悟飯の父親。孫悟空はチチの夫。" (two separate facts)
+RULE B [PROHIBIT AMBIGUOUS "AとBのC" PATTERN]:
+  Never write "XはAとBのC" when A and B have DIFFERENT relationship types with X.
+  Only use "AとBの" if A and B truly share the identical role (e.g., both are children of X).
+RULE C [NO HALLUCINATION]:
+  Use ONLY information from the provided descriptions. Do NOT add facts from memory.
+RULE D [PRESERVE DIRECTIONALITY]:
+  Sibling roles (兄/弟/姉/妹) must be preserved as-is. Never swap them.
+  Parent/child roles (父/母/息子/娘) must be preserved as-is. Never swap them.
+=== END CRITICAL MERGE RULES ===
+
+"""
+    if summ_key in PROMPTS and "CRITICAL MERGE RULES" not in PROMPTS[summ_key]:
+        PROMPTS[summ_key] = summ_prefix + PROMPTS[summ_key]
+        print("[GraphRAG] エンティティ要約プロンプト 'summarize_entity_descriptions' に誤合成防止ルールを注入しました")
+
+    # ── クエリ応答プロンプトにも幻覚抑制ルールを注入 ───────────────────────
+    # aquery() の回答生成でも同じ llm_func が呼ばれるが、クエリ用プロンプトには
+    # CRITICAL EXTRACTION RULES が含まれないため、別途ルールを注入する。
+    query_prefix = (
+        "=== STRICT ANSWER RULES ===\n"
+        "RULE A [NO HALLUCINATION]: Answer ONLY from the provided context/data tables below.\n"
+        "  Do NOT use any training knowledge, prior information, or inference not in the context.\n"
+        "RULE B [UNKNOWN = SAY SO]: If the answer is not in the provided context,\n"
+        "  state explicitly that the information is not available in the provided data.\n"
+        "  Do NOT guess or fill in from memory.\n"
+        "=== END STRICT ANSWER RULES ===\n\n"
+    )
+    _RAG_QUERY_PROMPT_KEYS = [
+        "local_rag_response",
+        "global_map_rag_response",
+        "global_reduce_rag_response",
+        "naive_rag_response",
+    ]
+    for qkey in _RAG_QUERY_PROMPT_KEYS:
+        if qkey in PROMPTS and "STRICT ANSWER RULES" not in PROMPTS[qkey]:
+            PROMPTS[qkey] = query_prefix + PROMPTS[qkey]
+            print(f"[GraphRAG] クエリ応答プロンプト '{qkey}' に幻覚抑制ルールを注入しました")
+
+
+_customize_extraction_prompts()
+
+
 def _make_sentence_chunker(
     max_chars: int = 200,
     overlap_sentences: int = 1,
@@ -224,6 +384,7 @@ class GraphRAGManager:
         search_mode: str = "hybrid",
         chunk_max_chars: int = 200,
         chunk_overlap_sentences: int = 1,
+        normalize_on_insert: bool = False,
     ):
         self.working_dir = Path(working_dir)
         self.working_dir.mkdir(parents=True, exist_ok=True)
@@ -239,6 +400,8 @@ class GraphRAGManager:
             # 文末チャンキング設定
             "chunk_max_chars": max(50, chunk_max_chars),  # チャンク最大文字数
             "chunk_overlap_sentences": max(0, chunk_overlap_sentences),  # オーバーラップ文数
+            # 登録時テキスト前処理
+            "normalize_on_insert": normalize_on_insert,  # True: 登録前に1文1事実化
         }
 
         # インデックス済みドキュメントの追跡: {ファイル名: フルパス}
@@ -297,6 +460,14 @@ class GraphRAGManager:
         embed_model = cfg["embedding_model"]
         api_key = cfg["api_key"]
         embed_dim = cfg["embedding_dim"]
+
+        # ── 同時 LLM 呼び出し制限 ─────────────────────────────────────────────
+        # LightRAG はチャンクを asyncio で並列処理するが、ローカル LM Studio では
+        # 複数スロットの KV キャッシュを同時確保しようとして VRAM が不足しやすい。
+        # （4スロット × 8192トークン分を同時確保 → VRAM超過 → Channel Error）
+        # Semaphore(1) で直列化することで KV キャッシュは常に 1スロット分のみ使用する。
+        import asyncio as _asyncio
+        _llm_semaphore = _asyncio.Semaphore(1)
 
         async def llm_func(
             prompt,
@@ -415,13 +586,30 @@ class GraphRAGManager:
                     msg["content"] = _sanitize(content)
                 messages.append(msg)
 
+            # ── エンティティ抽出コールへのグラウンディング ────────────────────
+            # system_prompt に我々が注入した "CRITICAL EXTRACTION RULES" が含まれる場合
+            # = エンティティ抽出コール（クエリ応答や gleaning 2回目では異なる）
+            # チャンクテキストの直前に「このテキストだけを使え」アンカーを追加する。
+            # system_prompt の先頭ルールを補強し、小規模モデルの幻覚をさらに抑制する。
+            _is_extraction = "CRITICAL EXTRACTION RULES" in (system_prompt or "")
+            if _is_extraction and prompt:
+                _grounding = (
+                    "[MANDATORY: Use ONLY the text provided in this message. "
+                    "Do NOT add any fact not explicitly written there.]\n\n"
+                )
+                prompt = _grounding + prompt
+
             # prompt 自体に <|#|> が含まれる場合もサニタイズ
             # （gleaning で前回の抽出結果が prompt に直接埋め込まれるケースへの対処）
             safe_prompt = _sanitize(prompt) if (prompt and "<|" in prompt) else prompt
             messages.append({"role": "user", "content": safe_prompt})
 
+            # temperature=0: 抽出タスクはランダム性ゼロが最適（創造性が幻覚になる）
             # model が未指定 or デフォルト値の場合は送らない（LM Studio は省略で自動選択）
-            payload: dict = {"messages": messages, "temperature": 0.1, "max_tokens": 4096}
+            # max_tokens: 抽出出力はエンティティ・関係リストなので 2048 で十分。
+            # 4096 にすると LM Studio が (prompt + max_tokens) > n_ctx を事前チェックして
+            # コンテキスト超過エラーを起こしやすくなる。
+            payload: dict = {"messages": messages, "temperature": 0, "max_tokens": 2048}
             if llm_model and llm_model not in ("", "local-model"):
                 payload["model"] = llm_model
 
@@ -431,50 +619,79 @@ class GraphRAGManager:
             }
             url = f"{base_url}/chat/completions"
 
-            async with httpx.AsyncClient(timeout=180.0) as client:
-                resp = await client.post(url, headers=headers, json=payload)
-
-                if resp.status_code == 400:
-                    err_text = resp.text
-                    print(f"[GraphRAG LLM Error] {resp.status_code}: {err_text[:300]}")
-
-                    # ── コンテキスト超過は sanitize では直らないので即スキップ ──────
-                    # LM Studio は "Context size has been exceeded" を返す。
-                    # sanitize リトライをしても状況は変わらないため直ちにスキップする。
-                    # 対処: LM Studio でモデルの「Context Length」を 8192 以上に設定する。
-                    if "context" in err_text.lower() and "exceed" in err_text.lower():
+            # ── Semaphore で LM Studio への同時接続を 1 件に制限 ─────────────────
+            # LightRAG はチャンクを asyncio で並列送信するが、LM Studio がスロットを
+            # 複数確保しようとして KV キャッシュ（VRAM）が不足することがある。
+            # Semaphore(1) で直列化し、常に 1 スロット分のみ使用させる。
+            await _llm_semaphore.acquire()
+            try:
+                async with httpx.AsyncClient(timeout=180.0) as client:
+                    # ── 1回目リクエスト ────────────────────────────────────────────
+                    try:
+                        resp = await client.post(url, headers=headers, json=payload)
+                    except httpx.TransportError as e:
+                        # Channel Error / 接続切断 ─ コンテキスト超過時に LM Studio が
+                        # 接続をドロップすると、並列リクエストがここに落ちる。
+                        # HTTP レスポンスが返らないため status_code では捕捉できない。
                         print(
-                            "[GraphRAG] ⚠️ コンテキスト超過 - チャンクをスキップします\n"
-                            "           → LM Studio でモデルの Context Length を 8192 以上に設定してください"
+                            f"[GraphRAG LLM Error] 接続切断 ({type(e).__name__}): {e}\n"
+                            "[GraphRAG] ⚠️ Channel Error - チャンクをスキップします\n"
+                            "           → LM Studio のモデル Context Length を 8192 以上に設定してください"
                         )
                         return ""
 
-                    # ── <|#|> トークン誤認識: 全メッセージを sanitize して再試行 ────
-                    print("[GraphRAG] ⚠️ 400エラー - 全メッセージをサニタイズして再試行します")
-
-                    retry_messages = []
-                    for msg in payload["messages"]:
-                        content = msg.get("content") or ""
-                        if isinstance(content, str) and "<|" in content:
-                            msg = dict(msg)
-                            msg["content"] = _sanitize(content)
-                        retry_messages.append(msg)
-
-                    retry_payload = dict(payload)
-                    retry_payload["messages"] = retry_messages
-                    resp = await client.post(url, headers=headers, json=retry_payload)
-
-                    # 再試行後も 400 → このチャンクのエンティティ抽出をスキップして継続
                     if resp.status_code == 400:
-                        print(f"[GraphRAG LLM Error 再試行] {resp.status_code}: {resp.text[:200]}")
-                        print("[GraphRAG] ⚠️ 再試行後も400エラー - チャンクをスキップして次へ継続")
-                        return ""  # 空文字 → LightRAG がエンティティなしとして次チャンクへ進む
+                        err_text = resp.text
+                        print(f"[GraphRAG LLM Error] {resp.status_code}: {err_text[:300]}")
 
-                if not resp.is_success:
-                    print(f"[GraphRAG LLM Error] {resp.status_code}: {resp.text[:600]}")
-                resp.raise_for_status()
-                content = resp.json()["choices"][0]["message"]["content"]
-                return _fix_llm_output(content)  # フィールド数超過による WARNING を抑制
+                        # ── コンテキスト超過は sanitize では直らないので即スキップ ──────
+                        # LM Studio は "Context size has been exceeded" を返す。
+                        # sanitize リトライをしても状況は変わらないため直ちにスキップする。
+                        # 対処: LM Studio でモデルの「Context Length」を 8192 以上に設定する。
+                        if "context" in err_text.lower() and "exceed" in err_text.lower():
+                            print(
+                                "[GraphRAG] ⚠️ コンテキスト超過 - チャンクをスキップします\n"
+                                "           → LM Studio でモデルの Context Length を 8192 以上に設定してください"
+                            )
+                            return ""
+
+                        # ── <|#|> トークン誤認識: 全メッセージを sanitize して再試行 ────
+                        print("[GraphRAG] ⚠️ 400エラー - 全メッセージをサニタイズして再試行します")
+
+                        retry_messages = []
+                        for msg in payload["messages"]:
+                            content = msg.get("content") or ""
+                            if isinstance(content, str) and "<|" in content:
+                                msg = dict(msg)
+                                msg["content"] = _sanitize(content)
+                            retry_messages.append(msg)
+
+                        retry_payload = dict(payload)
+                        retry_payload["messages"] = retry_messages
+
+                        # ── 2回目リクエスト（sanitize 後）────────────────────────────
+                        try:
+                            resp = await client.post(url, headers=headers, json=retry_payload)
+                        except httpx.TransportError as e:
+                            print(
+                                f"[GraphRAG LLM Error] 再試行後も接続切断 ({type(e).__name__}): {e}\n"
+                                "[GraphRAG] ⚠️ 再試行後も Channel Error - チャンクをスキップします"
+                            )
+                            return ""
+
+                        # 再試行後も 400 → このチャンクのエンティティ抽出をスキップして継続
+                        if resp.status_code == 400:
+                            print(f"[GraphRAG LLM Error 再試行] {resp.status_code}: {resp.text[:200]}")
+                            print("[GraphRAG] ⚠️ 再試行後も400エラー - チャンクをスキップして次へ継続")
+                            return ""  # 空文字 → LightRAG がエンティティなしとして次チャンクへ進む
+
+                    if not resp.is_success:
+                        print(f"[GraphRAG LLM Error] {resp.status_code}: {resp.text[:600]}")
+                    resp.raise_for_status()
+                    content = resp.json()["choices"][0]["message"]["content"]
+                    return _fix_llm_output(content)  # フィールド数超過による WARNING を抑制
+            finally:
+                _llm_semaphore.release()
 
         async def embed_func(texts: list[str]) -> np.ndarray:
             """LM Studio の /embeddings エンドポイントに1件ずつ直接リクエスト"""
@@ -507,6 +724,15 @@ class GraphRAGManager:
                 overlap_sentences=cfg["chunk_overlap_sentences"],
             ),
             entity_extract_max_gleaning=0,  # 2回目抽出を無効化（コンテキスト節約）
+            # ── エンティティ説明のLLM要約を無効化 ──────────────────────────────
+            # デフォルト: force_llm_summary_on_merge=8, summary_max_tokens=1200
+            # → 孫悟空のような頻出エンティティは8件以上の説明が集まり、
+            #   LLMが複数の説明を1文に「統合」しようとして
+            #   "孫悟飯とチチの父親" のような誤合成を起こす。
+            # 対策: 閾値を大幅に引き上げ、<SEP>結合（LLMなし）を使わせる。
+            # <SEP>結合は冗長だが正確性を保てる。小規模モデルでの安全な選択。
+            force_llm_summary_on_merge=9999,  # 実質的にLLM要約を無効化
+            summary_max_tokens=99999,          # トークン上限を無効化
             addon_params={
                 "language": "Japanese",
                 "entity_types": ["組織", "人物", "概念", "場所", "イベント", "製品"],
@@ -601,10 +827,18 @@ class GraphRAGManager:
             return {"success": False, "file": file_path.name, "message": "テキストを抽出できませんでした"}
 
         try:
+            # 登録前テキスト前処理（normalize_on_insert=True のとき）
+            if self._config.get("normalize_on_insert", False):
+                print(f"[GraphRAG] 登録前テキスト前処理（1文1事実）を適用: {file_path.name}")
+                text = await self._normalize_full_text(text)
+
             await self._rag.ainsert(text)
+            # 抽出後の誤合成パターン（"AとBの父親"）を Relations と照合して修正
+            await self._fix_compound_parent_descriptions()
             self._docs[file_path.name] = str(file_path)
             self._save_docs_index()
-            return {"success": True, "file": file_path.name, "message": "グラフへの追加が完了しました"}
+            mode_label = "（前処理あり）" if self._config.get("normalize_on_insert") else ""
+            return {"success": True, "file": file_path.name, "message": f"グラフへの追加が完了しました{mode_label}"}
         except Exception as e:
             return {"success": False, "file": file_path.name, "message": str(e)}
 
@@ -632,10 +866,14 @@ class GraphRAGManager:
                 try:
                     text = self._read_file(fp)
                     if text.strip():
+                        if self._config.get("normalize_on_insert", False):
+                            text = await self._normalize_full_text(text)
                         await self._rag.ainsert(text)
                         self._docs[fname] = fpath
                 except Exception:
                     pass
+        # 再構築後も誤合成パターンを修正
+        await self._fix_compound_parent_descriptions()
         self._save_docs_index()
 
         return {"success": True, "message": f"{file_name} を削除してグラフを再構築しました"}
@@ -672,22 +910,37 @@ class GraphRAGManager:
         search_mode = mode or self.search_mode
         print(f"[GraphRAG] 検索開始: mode={search_mode}, docs={len(self._docs)}, query={query[:40]}")
         try:
-            result = await self._rag.aquery(
+            # only_need_context=True: LightRAG がグラフから取得した生データ（エンティティ・
+            # 関係性・チャンクの一覧テキスト）を返す。LLM による回答生成は行わない。
+            #
+            # 【なぜ only_need_context=True か】
+            # aquery() がデフォルト (False) の場合、LightRAG は内部で llm_func を呼んで
+            # グラフデータを元に回答を生成する。この段階で LLM がグラフ外の学習知識を
+            # 混入させてハルシネーションを起こすことがある。
+            # only_need_context=True にすると、グラフの生データ（事実の列挙）だけが返り、
+            # LLM による解釈・合成は行われない。回答の生成はチャット側の LLM に委ねる。
+            context = await self._rag.aquery(
                 query,
                 param=QueryParam(
                     mode=search_mode,
-                    top_k=10,               # 取得エンティティ数（デフォルト40）
-                    chunk_top_k=5,          # 取得チャンク数（デフォルト20）
-                    max_entity_tokens=600,  # エンティティ最大トークン（デフォルト6000）
-                    max_relation_tokens=800, # リレーション最大トークン（デフォルト8000）
-                    max_total_tokens=2000,  # 合計最大トークン（デフォルト30000）
+                    only_need_context=True,  # ← グラフ生データのみ取得（LLM呼び出しなし）
+                    top_k=30,               # 取得エンティティ数（デフォルト40）
+                    chunk_top_k=10,         # 取得チャンク数（デフォルト20）
+                    max_entity_tokens=4000, # エンティティ最大トークン（デフォルト6000）
+                    max_relation_tokens=4000, # リレーション最大トークン（デフォルト8000）
+                    max_total_tokens=8000,  # 合計最大トークン（デフォルト30000）
                     enable_rerank=False,    # rerankモデル未設定のため無効化
                 ),
             )
-            if result and result.strip():
-                print(f"[GraphRAG] 検索成功: {len(result)}文字の回答を取得")
-                print(f"[GraphRAG] 検索結果:\n{'='*60}\n{result}\n{'='*60}")
-                return [{"content": result, "source": f"GraphRAG ({search_mode})", "score": 1.0}]
+            if context and context.strip():
+                print(f"[GraphRAG] 検索成功: {len(context)}文字のコンテキストを取得")
+                # 関係性セクションを重点的にログ出力
+                rel_start = context.find("Relationships")
+                if rel_start >= 0:
+                    print(f"[GraphRAG] 検索コンテキスト（Relationships）:\n{'='*60}\n{context[rel_start:rel_start+1200]}\n{'='*60}")
+                else:
+                    print(f"[GraphRAG] 検索コンテキスト:\n{'='*60}\n{context[:1200]}\n{'='*60}")
+                return [{"content": context, "source": f"GraphRAG ({search_mode})", "score": 1.0}]
             print("[GraphRAG] 検索結果が空でした")
             return []
         except Exception as e:
@@ -696,15 +949,322 @@ class GraphRAGManager:
 
     # ── 状態確認 ──────────────────────────────────────────────────────────
 
+    # ── LLM モデル変更 ────────────────────────────────────────────────────
+
+    async def set_llm_model(self, model: str) -> None:
+        """
+        GraphRAG インデックス作成時に使う LLM モデルを切り替える。
+
+        model: "" → 次回 initialize() 時に自動検出
+        model: "some-model-id" → 指定モデルを使用
+
+        LightRAG インスタンスを再生成してストレージを再接続する。
+        既存のグラフデータは保持される。
+        """
+        self._config["llm_model"] = model
+        self._rag = self._create_rag_instance()
+        if hasattr(self._rag, "initialize_storages"):
+            await self._rag.initialize_storages()
+        label = model if model else "（自動検出）"
+        print(f"[GraphRAG] LLM モデルを変更しました: {label}")
+
     def get_status(self) -> dict:
         return {
             "total_documents": len(self._docs),
             "documents": sorted(self._docs.keys()),
             "search_mode": self.search_mode,
             "mode": "GraphRAG (LightRAG)",
+            "llm_model": self._config.get("llm_model", ""),
+            "normalize_on_insert": self._config.get("normalize_on_insert", False),
         }
 
     # ── デバッグ用: チャンクごとのLLM入出力を可視化 ───────────────────────
+
+    # ── テキスト前処理（複合文 → 単純文） ──────────────────────────────
+
+    async def _normalize_full_text(self, text: str) -> str:
+        """
+        ドキュメント全体を段落単位で 1文1事実化する。
+
+        add_document() で normalize_on_insert=True のときに呼ばれる。
+        段落（空行区切り）ごとに _normalize_text() を適用して結合して返す。
+        短い段落（80文字以下）は複合文の可能性が低いためスキップして処理を高速化する。
+
+        Returns:
+            正規化済みテキスト。段落ごとの LLM 失敗は元テキストで継続。
+        """
+        paragraphs = text.split("\n\n")
+        normalized: list[str] = []
+        total = len(paragraphs)
+        for i, para in enumerate(paragraphs):
+            stripped = para.strip()
+            if not stripped:
+                normalized.append(para)
+                continue
+            # 短い段落はスキップ（複合文になりにくい）
+            if len(stripped) <= 80:
+                normalized.append(para)
+                continue
+            print(f"[GraphRAG] テキスト前処理 [{i+1}/{total}]: {stripped[:40]}...")
+            norm_para = await self._normalize_text(stripped)
+            normalized.append(norm_para)
+        result = "\n\n".join(normalized)
+        print(f"[GraphRAG] テキスト前処理完了: {len(text)}文字 → {len(result)}文字")
+        return result
+
+    async def _fix_compound_parent_descriptions(self) -> None:
+        """
+        グラフ構築後に実行するエンティティ説明の後処理。
+
+        小規模 LLM が抽出ステップで生成する「AとBのC（父親など）」という
+        誤合成パターンを Relations データと照合して修正する。
+
+        【問題パターン】
+            孫悟空の説明: "孫悟空は孫悟飯とチチの父親"
+            ↑ チチは孫悟空の妻なのに子ども扱いになっている
+
+        【修正戦略（ホワイトリスト方式）】
+        Z=「父親/母親」のとき:
+          X・Y それぞれについてグラフのエッジを検索し、
+          「親子関係」を示すキーワードのエッジが存在するエンティティのみ保持。
+          親子エッジがない（=配偶者・兄弟など）エンティティは除外して分離。
+        """
+        import re as _re
+
+        print("[GraphRAG] description後処理: 誤合成パターンのスキャン開始")
+
+        # 親子関係を示す役割語
+        _PARENT_ROLES = r"(?:父親?|母親?|保護者|親)"
+        _CHILD_ROLES  = r"(?:息子|娘|子供?|子ども(?:たち)?)"
+        _FAMILY_ROLES = _PARENT_ROLES + r"|" + _CHILD_ROLES + r"|(?:兄|弟|姉|妹)"
+
+        # "AはXとYのZ" のパターン
+        _COMPOUND_PAT = _re.compile(
+            r"^(.+?)は(.+?)と(.+?)の(" + _FAMILY_ROLES + r")"
+        )
+
+        # 親子関係を示すキーワード（グラフのエッジの description/keywords に含まれる）
+        _PARENT_CHILD_KW = {
+            "父", "母", "父親", "母親", "息子", "娘", "子", "親子",
+            "父子", "母子", "son", "daughter", "father", "mother", "child", "parent",
+        }
+
+        # ① グラフの全ノード名を取得
+        try:
+            entity_names: list[str] = await self._rag.get_graph_labels()
+            if not isinstance(entity_names, list):
+                entity_names = list(entity_names) if entity_names else []
+            print(f"[GraphRAG] description後処理: {len(entity_names)}エンティティを取得")
+        except Exception as e:
+            print(f"[GraphRAG] description後処理: ノード一覧取得失敗 ({e})")
+            return
+
+        if not entity_names:
+            print("[GraphRAG] description後処理: エンティティなし")
+            return
+
+        # ② 全エッジを一括取得してキャッシュ（エンティティ名 → 隣接エンティティ集合）
+        # 辺ラベルで「親子エッジ」の対を記録: {(src, tgt)} or {(tgt, src)} if parent-child
+        parent_child_pairs: set[frozenset[str]] = set()
+        try:
+            # ルートノードを適当に1つ選んで深さ99で取得する代わりに
+            # 全エンティティ分ループして1-hop エッジを集める
+            for ename in entity_names:
+                try:
+                    kg = await self._rag.get_knowledge_graph(
+                        node_label=ename, max_depth=1, max_nodes=200
+                    )
+                    for edge in (kg.edges or []):
+                        eprops = edge.properties or {}
+                        edge_desc = (eprops.get("description", "") or "").lower()
+                        edge_kw   = (eprops.get("keywords",    "") or "").lower()
+                        edge_text = edge_desc + " " + edge_kw
+                        if any(kw in edge_text for kw in _PARENT_CHILD_KW):
+                            parent_child_pairs.add(frozenset([edge.source, edge.target]))
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[GraphRAG] description後処理: エッジ取得エラー ({e})")
+
+        print(f"[GraphRAG] description後処理: 親子エッジペア {len(parent_child_pairs)}組を検出")
+
+        fixed_count = 0
+        sep = "<SEP>"
+
+        for ename in entity_names:
+            try:
+                info = await self._rag.get_entity_info(ename)
+            except Exception:
+                continue
+
+            if not info:
+                continue
+
+            node_data = (info.get("graph_data") or {}) if isinstance(info, dict) else {}
+            raw_desc  = (node_data.get("description", "") or "") if isinstance(node_data, dict) else ""
+            if not raw_desc:
+                continue
+
+            fragments    = raw_desc.split(sep)
+            new_fragments: list[str] = []
+            changed = False
+
+            for frag in fragments:
+                frag_stripped = frag.strip()
+                m = _COMPOUND_PAT.match(frag_stripped)
+                if not m:
+                    new_fragments.append(frag)
+                    continue
+
+                subj, ent_a, ent_b, role = m.groups()
+                subj_s = subj.strip()
+                a_s    = ent_a.strip()
+                b_s    = ent_b.strip()
+
+                print(f"[GraphRAG] description後処理: パターン検出 '{frag_stripped}'")
+                print(f"  subj={subj_s}, A={a_s}, B={b_s}, role={role}")
+
+                # ホワイトリスト方式: 親子エッジが確認できるエンティティのみ残す
+                a_has_parent_child = frozenset([subj_s, a_s]) in parent_child_pairs
+                b_has_parent_child = frozenset([subj_s, b_s]) in parent_child_pairs
+
+                print(f"  A({a_s})親子エッジ: {a_has_parent_child}, B({b_s})親子エッジ: {b_has_parent_child}")
+
+                # 両方とも親子エッジあり → 正当な複数の子 → 変更不要
+                if a_has_parent_child and b_has_parent_child:
+                    new_fragments.append(frag)
+                    continue
+
+                # 片方しか親子エッジがない → 誤合成
+                parts: list[str] = []
+                if a_has_parent_child:
+                    parts.append(f"{subj_s}は{a_s}の{role}")
+                elif not a_has_parent_child and not b_has_parent_child:
+                    # 両方とも親子エッジなし → エンティティ説明から判断
+                    # この場合はフォールバックとして元のフラグメントを保持
+                    new_fragments.append(frag)
+                    continue
+                if b_has_parent_child:
+                    parts.append(f"{subj_s}は{b_s}の{role}")
+
+                if parts:
+                    new_frag = sep.join(parts)
+                    new_fragments.append(new_frag)
+                    print(f"[GraphRAG] description修正: '{frag_stripped}' → '{new_frag}'")
+                    changed = True
+                else:
+                    new_fragments.append(frag)
+
+            if changed:
+                new_desc = sep.join(new_fragments)
+                try:
+                    await self._rag.aedit_entity(ename, {"description": new_desc})
+                    fixed_count += 1
+                except Exception as e2:
+                    print(f"[GraphRAG] description修正失敗 '{ename}': {e2}")
+
+        print(f"[GraphRAG] description後処理完了: {len(entity_names)}件スキャン, {fixed_count}件修正")
+
+    async def _normalize_text(self, text: str, model: str = "") -> str:
+        """
+        複合文を「1文1事実」のシンプルな文列に変換する前処理。
+
+        エンティティ抽出の前に適用することで、8B クラスの小規模 LLM が
+        「AとBのC（役割）」「Xで、Y」などの複合構文を誤って解析する問題を回避する。
+
+        【変換例】
+          元: 孫悟飯は孫悟空とチチの息子で、孫悟天の兄。
+          後: 孫悟飯は孫悟空の息子である。
+              孫悟飯はチチの息子である。
+              孫悟飯は孫悟天の兄である。
+
+        【設計方針】
+        - タスクを「書き換え」に限定（知識は不要）→ 8B モデルでも比較的高精度
+        - ドメイン非依存（人物・組織・技術文書など任意の入力に適用可能）
+        - _debug_llm_call を経由するため、デバッガーと本番で同じモデルを使用
+        - 失敗した場合は元のテキストを返して処理を継続（エラー非透過）
+
+        Args:
+            text:  正規化対象のテキスト（通常はチャンク単位）
+            model: 使用モデル。空 = RAG デフォルト, 文字列 = 指定モデル
+
+        Returns:
+            正規化後のテキスト。LLM 呼び出し失敗時は元テキストをそのまま返す。
+        """
+        system_prompt = (
+            "You are a text simplification assistant.\n"
+            "Task: Rewrite the input text as simple, independent sentences.\n"
+            "\n"
+            "Rules:\n"
+            "  1. Each output sentence must express EXACTLY ONE fact or relationship.\n"
+            "  2. Preserve ALL information from the original — do NOT omit, add, or change any facts.\n"
+            "  3. Compound subjects: split into separate sentences.\n"
+            "     Input : 'C is [role] of A and B'\n"
+            "     Output: 'C is [role] of A.' AND 'C is [role] of B.' (two sentences)\n"
+            "  4. Compound predicates: split into separate sentences.\n"
+            "     Input : 'X is Y, and does Z'\n"
+            "     Output: 'X is Y.' AND 'X does Z.' (two sentences)\n"
+            "  5. Output ONLY the simplified sentences, one per line. No explanations.\n"
+            "  6. Keep the SAME language as the input."
+        )
+        user_prompt = f"Simplify into one-fact-per-sentence:\n\n{text}"
+
+        try:
+            result = await self._debug_llm_call(user_prompt, system_prompt, model=model)
+            normalized = result.strip()
+            return normalized if normalized else text
+        except Exception as e:
+            print(f"[GraphRAG] テキスト正規化失敗（元テキストを使用）: {e}")
+            return text
+
+    async def _debug_llm_call(
+        self,
+        user_prompt: str,
+        system_prompt: str,
+        model: str = "",
+    ) -> str:
+        """
+        デバッグ用 LLM 呼び出し。
+
+        model が空の場合は通常の llm_model_func（本番と同じ _fix_llm_output 適用済み）を使う。
+        model が指定された場合は、そのモデルで直接 HTTP 呼び出しを行い
+        生応答をそのまま返す（_fix_llm_output は適用しない）。
+        デバッガーでは「LLM が実際に何を返したか」を見たいため、修正なしの方が有用。
+        """
+        if not model:
+            # 本番と同じ llm_func（_fix_llm_output 適用済み）
+            return await self._rag.llm_model_func(
+                user_prompt,
+                system_prompt=system_prompt,
+            )
+
+        # モデル指定あり → 直接 HTTP 呼び出し（生応答を返す）
+        cfg = self._config
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2048,
+        }
+        headers = {
+            "Authorization": f"Bearer {cfg['api_key']}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            try:
+                resp = await client.post(
+                    f"{cfg['lm_studio_base_url']}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+            except httpx.TransportError as e:
+                return f"[Channel Error] 接続切断: {type(e).__name__}: {e}"
+            if not resp.is_success:
+                return f"[ERROR {resp.status_code}] {resp.text[:300]}"
+            return resp.json()["choices"][0]["message"]["content"]
 
     async def debug_extract(
         self,
@@ -712,6 +1272,8 @@ class GraphRAGManager:
         max_chars: int = 200,
         overlap_sentences: int = 1,
         max_chunks: int = 5,
+        model: str = "",
+        normalize: bool = False,
     ):
         """
         チャンクごとのLLM入力・出力を非同期ジェネレータで返す。
@@ -782,20 +1344,41 @@ class GraphRAGManager:
             return
 
         # ── 各チャンクを処理 ───────────────────────────────────────────
+        import time as _time
+
         for i, chunk in enumerate(chunks[:max_chunks]):
             chunk_text: str = chunk["content"]
             chunk_tokens: int = chunk["tokens"]
 
+            # ── 前処理: 複合文 → 単純文（オプション）──────────────────────
+            normalize_elapsed: float | None = None
+            normalized_text: str | None = None
+            if normalize:
+                t_norm = _time.perf_counter()
+                normalized_text = await self._normalize_text(chunk_text, model=model)
+                normalize_elapsed = round(_time.perf_counter() - t_norm, 2)
+
+            # 抽出に使うテキスト（前処理ありなら正規化済みテキストを使う）
+            extraction_text = normalized_text if (normalize and normalized_text) else chunk_text
+
+            # llm_func のグラウンディングと同じ前置きを input_text に埋め込む。
+            # デバッガーで「実際に LLM に送っているテキスト」を可視化するため、
+            # ユーザープロンプト側に明示する（llm_func 側のアンカーと二重適用になるが
+            # 小規模モデルへの強調として意図的）。
+            _grounded_input = (
+                "[Use ONLY the following text. Do NOT add any fact not written here.]\n\n"
+                + extraction_text
+            )
             user_prompt = PROMPTS["entity_extraction_user_prompt"].format(
-                **{**context_base, "input_text": chunk_text}
+                **{**context_base, "input_text": _grounded_input}
             )
 
-            import time as _time
             t0 = _time.perf_counter()
             try:
-                raw_response: str = await self._rag.llm_model_func(
+                raw_response: str = await self._debug_llm_call(
                     user_prompt,
                     system_prompt=system_prompt,
+                    model=model,
                 )
             except Exception as e:
                 raw_response = f"[ERROR] {e}"
@@ -809,6 +1392,8 @@ class GraphRAGManager:
                 "total_chunks": total_chunks,
                 "process_count": process_count,
                 "chunk_text": chunk_text,
+                "normalized_text": normalized_text,        # None = 前処理なし
+                "normalize_elapsed_sec": normalize_elapsed, # None = 前処理なし
                 "tokens": chunk_tokens,
                 "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
@@ -823,6 +1408,129 @@ class GraphRAGManager:
             "total_chunks": total_chunks,
             "processed": process_count,
         }
+
+
+# 役割語の相互関係マップ（A が B の [key] → B は A の [value]）
+_RECIPROCAL_ROLES: dict[str, str] = {
+    "弟":   "兄",
+    "兄":   "弟",
+    "妹":   "姉",
+    "姉":   "妹",
+    "弟子": "師匠",
+    "師匠": "弟子",
+    "部下": "上司",
+    "上司": "部下",
+}
+
+
+def _fix_reciprocal_descriptions(
+    entities: list[dict],
+    relations: list[dict],
+) -> list[dict]:
+    """
+    「AはBのX（役割）」という entity description が、
+    relation の方向と矛盾している場合に説明文を修正する。
+
+    【修正の仕組み】
+    1. 各 relation から「srcはtgtのkeyword」の事実を構築
+    2. 各 entity の description で「EntityはXのY（役割）」パターンを検出
+    3. 検出された役割が relation と逆向きになっている場合、_RECIPROCAL_ROLES で修正
+
+    例:
+      relation: 孫悟天 → 孫悟飯, keywords=弟  （孫悟天は孫悟飯の弟）
+      entity 孫悟飯の description: 「孫悟飯は孫悟天の弟です。」← 矛盾（relation で弟は孫悟天側）
+      修正後:「孫悟飯は孫悟天の兄です。」（弟 → 兄 に変換）
+
+    【限界】
+    - 役割語が description に日本語で明示されている場合のみ機能する
+    - マップにない役割語（父/母など親子は息子/娘側のみに定義）は修正不能
+    - description のパースが文字列マッチに依存するため、表現が違うと検出できない
+    """
+    import re as _re
+
+    # relation から「src は tgt の [role]」の事実セットを構築
+    # key: (src, tgt) → set of role words in that direction
+    # 抽出元は keywords と description の両方を使う
+    relation_roles: dict[tuple[str, str], set[str]] = {}
+    for rel in relations:
+        src  = rel.get("source", "").strip()
+        tgt  = rel.get("target", "").strip()
+        kw   = rel.get("keywords", "")
+        desc = rel.get("description", "")
+        if not src or not tgt:
+            continue
+
+        roles_found: set[str] = set()
+
+        # ① キーワードを分割して直接追加 + 複合語内の役割語も抽出
+        #    例: "兄弟関係" → "兄弟関係" を追加し、さらに "弟"・"兄" も追加
+        for k in _re.split(r"[,、・/\s]+", kw):
+            k = k.strip()
+            if not k:
+                continue
+            roles_found.add(k)
+            # 複合キーワードに役割語が含まれるか確認（例: "兄弟関係" に "弟" が含まれる）
+            for role in _RECIPROCAL_ROLES:
+                if role in k and k != role:
+                    roles_found.add(role)
+
+        # ② description の「src は tgt の[役割]」パターンから役割語を抽出
+        #    例: "孫悟天は孫悟飯の弟です" → role="弟" を (孫悟天, 孫悟飯) に追加
+        if desc and src and tgt:
+            m = _re.search(
+                rf"{_re.escape(src)}は{_re.escape(tgt)}の(\S+?)(?:です|。|ます|でした|だ)",
+                desc,
+            )
+            if m:
+                r = m.group(1).strip("。、")
+                if r in _RECIPROCAL_ROLES:
+                    roles_found.add(r)
+
+        for r in roles_found:
+            relation_roles.setdefault((src, tgt), set()).add(r)
+
+    # エンティティ名リスト（検索用）
+    all_names = [e.get("name", "").strip() for e in entities]
+
+    fixed: list[dict] = []
+    for ent in entities:
+        ent_name = ent.get("name", "").strip()
+        desc = ent.get("description", "")
+
+        new_desc = desc
+        corrected = False
+
+        for role, inv_role in _RECIPROCAL_ROLES.items():
+            if corrected:
+                break
+            for other in all_names:
+                if not other or other == ent_name:
+                    continue
+                # \S+ が日本語で貪欲マッチする問題を避けるため、
+                # 既知エンティティ名 + "の" + 役割語 を直接文字列検索する
+                search_str = f"{other}の{role}"
+                if search_str not in desc:
+                    continue
+
+                # desc に「otherの{role}」が含まれる → 方向を relation と照合
+                # direct: (ent_name → other) に role がある → description が正しい方向
+                direct_ok = role in relation_roles.get((ent_name, other), set())
+                # reverse: (other → ent_name) に role がある → ent_name は other の role
+                #           つまり description は逆向きになっている
+                reverse_has_role = role in relation_roles.get((other, ent_name), set())
+
+                if reverse_has_role and not direct_ok:
+                    # 矛盾: other が ent_name の role なのに、description は逆
+                    new_desc = new_desc.replace(search_str, f"{other}の{inv_role}")
+                    print(
+                        f"[GraphRAG] description 修正: {ent_name} "
+                        f"「{other}の{role}」→「{other}の{inv_role}」"
+                    )
+                    corrected = True
+                    break
+
+        fixed.append({**ent, "description": new_desc})
+    return fixed
 
 
 def _parse_extraction_response(response: str) -> tuple[list[dict], list[dict]]:
@@ -864,5 +1572,8 @@ def _parse_extraction_response(response: str) -> tuple[list[dict], list[dict]]:
                 "description": parts[4] if len(parts) > 4 else "",
                 "raw":         line,
             })
+
+    # 相互関係の逆転を後処理で修正（例: 「孫悟飯は孫悟天の弟」→「孫悟飯は孫悟天の兄」）
+    entities = _fix_reciprocal_descriptions(entities, relations)
 
     return entities, relations
