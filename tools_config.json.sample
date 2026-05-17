@@ -1,0 +1,27 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "get_inventory",
+      "description": "在庫管理システムの商品在庫を検索する。在庫数の上限、下限で商品を絞り込むことができます。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "商品カテゴリ。例: 果物, 飲料, 菓子"
+          },
+          "stock_le": {
+            "type": "integer",
+            "description": "在庫数の上限"
+          },
+          "stock_ge": {
+            "type": "integer",
+            "description": "在庫数の下限"
+          }
+        },
+        "required": []
+      }
+    }
+  }
+]
